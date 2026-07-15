@@ -188,6 +188,25 @@ namespace
         }
         return total;
     }
+
+    // Find the first free bag slot (backpack first, then extra bags).
+    // Returns a packed (bag<<8)|slot position, or 0xFFFF if bags are full.
+    uint16 FindFreeBagSlot(Player* bot)
+    {
+        for (uint8 s = INVENTORY_SLOT_ITEM_START; s < INVENTORY_SLOT_ITEM_END; ++s)
+            if (!bot->GetItemByPos(INVENTORY_SLOT_BAG_0, s))
+                return (uint16(INVENTORY_SLOT_BAG_0) << 8) | s;
+
+        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+        {
+            Bag* bag = bot->GetBagByPos(b);
+            if (!bag) continue;
+            for (uint8 s = 0; s < bag->GetBagSize(); ++s)
+                if (!bot->GetItemByPos(b, s))
+                    return (uint16(b) << 8) | s;
+        }
+        return 0xFFFF;
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -200,8 +219,10 @@ public:
     {
         static ChatCommandTable armyTable =
         {
-            { "equip", HandleEquipCmd, SEC_GAMEMASTER, Console::No },
-            { "gear",  HandleGearCmd,  SEC_GAMEMASTER, Console::No },
+            { "equip",     HandleEquipCmd,     SEC_PLAYER, Console::No },
+            { "gear",      HandleGearCmd,      SEC_PLAYER, Console::No },
+            { "equipitem", HandleEquipItemCmd, SEC_PLAYER, Console::No },
+            { "unequip",   HandleUnequipCmd,   SEC_PLAYER, Console::No },
         };
         static ChatCommandTable topTable =
         {
@@ -265,6 +286,109 @@ public:
             else
                 handler->PSendSysMessage("  {}: (empty)", SlotName(slot));
         }
+        return true;
+    }
+
+    // ─── .army equipitem <name> <bag> <slot> ───────────────────────────────
+    // Equips one specific bag item into its matching equipment slot.
+    // Used by the Army panel's Bags tab (click a bag item to equip it).
+    static bool HandleEquipItemCmd(ChatHandler* handler, std::string name, uint8 bag, uint8 slot)
+    {
+        Player* master = handler->GetSession()->GetPlayer();
+        if (!master) return false;
+
+        BotInfo* info = sBotMgr.FindBot(master->GetGUID().GetCounter(), name);
+        if (!info || !info->player)
+        {
+            handler->PSendSysMessage("|cffff0000No bot named '{}' found.|r", name);
+            return true;
+        }
+        Player* bot = info->player;
+
+        Item* item = bot->GetItemByPos(bag, slot);
+        if (!item || !item->GetTemplate())
+        {
+            handler->PSendSysMessage("|cffff0000No item at that bag position.|r");
+            return true;
+        }
+
+        ItemTemplate const* proto = item->GetTemplate();
+        uint8 s1, s2;
+        InvTypeToSlots(proto->InventoryType, s1, s2);
+        if (s1 == NO_SLOT)
+        {
+            handler->PSendSysMessage("|cffff0000{} can't be equipped.|r", proto->Name1);
+            return true;
+        }
+
+        // For dual-slot items (rings/trinkets), prefer an empty slot, else the weaker one
+        uint8 target = s1;
+        if (s2 != NO_SLOT)
+        {
+            uint32 i1 = EquippedILvl(bot, s1);
+            uint32 i2 = EquippedILvl(bot, s2);
+            target = (i1 == 0) ? s1 : (i2 == 0) ? s2 : ((i1 <= i2) ? s1 : s2);
+        }
+
+        uint16 dest;
+        if (bot->CanEquipItem(target, dest, item, true) != EQUIP_ERR_OK)
+        {
+            handler->PSendSysMessage("|cffff0000{} can't equip {}.|r", bot->GetName(), proto->Name1);
+            return true;
+        }
+
+        uint16 src = (uint16(bag) << 8) | slot;
+        uint16 dst = (uint16(INVENTORY_SLOT_BAG_0) << 8) | target;
+        bot->SwapItem(src, dst);
+        bot->SaveToDB(false, true);
+
+        handler->PSendSysMessage("|cff00ff00{} equipped {} \342\206\222 {}.|r",
+                                 bot->GetName(), proto->Name1, SlotName(target));
+        return true;
+    }
+
+    // ─── .army unequip <name> <slot> ───────────────────────────────────────
+    // Moves an equipped item back into the first free bag slot.
+    static bool HandleUnequipCmd(ChatHandler* handler, std::string name, uint8 slot)
+    {
+        Player* master = handler->GetSession()->GetPlayer();
+        if (!master) return false;
+
+        BotInfo* info = sBotMgr.FindBot(master->GetGUID().GetCounter(), name);
+        if (!info || !info->player)
+        {
+            handler->PSendSysMessage("|cffff0000No bot named '{}' found.|r", name);
+            return true;
+        }
+        Player* bot = info->player;
+
+        if (slot < EQUIPMENT_SLOT_START || slot >= EQUIPMENT_SLOT_END)
+        {
+            handler->PSendSysMessage("|cffff0000Invalid equipment slot.|r");
+            return true;
+        }
+
+        Item* item = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!item)
+        {
+            handler->PSendSysMessage("|cffff0000Nothing equipped in that slot.|r");
+            return true;
+        }
+
+        uint16 freeDst = FindFreeBagSlot(bot);
+        if (freeDst == 0xFFFF)
+        {
+            handler->PSendSysMessage("|cffff0000{}'s bags are full.|r", bot->GetName());
+            return true;
+        }
+
+        ItemTemplate const* proto = item->GetTemplate();
+        uint16 src = (uint16(INVENTORY_SLOT_BAG_0) << 8) | slot;
+        bot->SwapItem(src, freeDst);
+        bot->SaveToDB(false, true);
+
+        handler->PSendSysMessage("|cff00ff00{} unequipped {}.|r",
+                                 bot->GetName(), proto ? proto->Name1 : "item");
         return true;
     }
 };

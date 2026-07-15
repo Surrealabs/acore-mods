@@ -352,6 +352,17 @@ static void FinishBotSpawn(ObjectGuid masterGuid, WorldSession* botSession, Obje
     }
     group->AddMember(bot);
 
+    // ── Force Master Loot ──
+    // Bots are socketless Player objects: they can never respond to a
+    // Need/Greed roll prompt, so the default GROUP_LOOT method leaves every
+    // drop hanging until the full roll timeout (60s) elapses before it can
+    // be assigned — making looting feel completely broken. Master Loot lets
+    // the human master hand items to bots directly (see .army equip/equipitem).
+    group->SetLootMethod(MASTER_LOOT);
+    group->SetLooterGuid(master->GetGUID());
+    group->SetMasterLooterGuid(master->GetGUID());
+    group->SendUpdate();
+
     // ── Detect role and spec ──
     BotRole role = DetectBotRole(bot);
     uint8 specIdx = DetectSpecIndex(bot);
@@ -396,6 +407,7 @@ public:
                 { "rotation", HandleArmyShowRotationCommand, SEC_PLAYER,     Console::No },
                 { "reload",   HandleArmyReloadCommand,       SEC_GAMEMASTER, Console::No },
                 { "selfbot",  HandleArmySelfBotCommand,      SEC_PLAYER,     Console::No },
+                { "loot",     HandleArmyLootCommand,         SEC_PLAYER,     Console::No },
         };
         static ChatCommandTable commandTable =
         {
@@ -656,6 +668,31 @@ public:
         else if (newRole == BotRole::ROLE_RANGED_DPS) roleName = "Ranged DPS";
 
         handler->PSendSysMessage("|cff00ff00{} is now set to {}.|r", nameArg, roleName);
+        return true;
+    }
+
+    // .army loot — re-apply Master Loot to your current party (fixes groups
+    // that were formed before this feature existed, without needing to
+    // dismiss/respawn every bot).
+    static bool HandleArmyLootCommand(ChatHandler* handler)
+    {
+        Player* master = handler->GetSession()->GetPlayer();
+        if (!master)
+            return false;
+
+        Group* group = master->GetGroup();
+        if (!group)
+        {
+            handler->PSendSysMessage("|cffff0000You are not in a party.|r");
+            return true;
+        }
+
+        group->SetLootMethod(MASTER_LOOT);
+        group->SetLooterGuid(master->GetGUID());
+        group->SetMasterLooterGuid(master->GetGUID());
+        group->SendUpdate();
+
+        handler->PSendSysMessage("|cff00ff00Master Loot enabled — you are now the loot master.|r");
         return true;
     }
 
