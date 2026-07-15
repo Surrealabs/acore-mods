@@ -1,0 +1,650 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+
+/* ──────────────────────────────────────────────────────────────────
+ *  Types
+ * ────────────────────────────────────────────────────────────────── */
+
+interface TalentEntry {
+  origIdx: number;
+  id: number;
+  tabId: number;
+  row: number;
+  col: number;
+  spellRanks: number[];
+  maxRank: number;
+  prereqTalents: number[];
+  prereqRanks: number[];
+  flags: number;
+  requiredSpellId: number;
+  petFlags: number[];
+  iconName?: string;
+}
+
+interface TabInfo {
+  id: number;
+  name: string;
+  talents: TalentEntry[];
+}
+
+interface ClassTabs {
+  className: string;
+  classId: number;
+  tabs: TabInfo[];
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ *  Constants
+ * ────────────────────────────────────────────────────────────────── */
+
+const CLASS_NAMES: Record<number, string> = {
+  1: 'Warrior', 2: 'Paladin', 3: 'Hunter', 4: 'Rogue', 5: 'Priest',
+  6: 'Death Knight', 7: 'Shaman', 8: 'Mage', 9: 'Warlock', 11: 'Druid',
+};
+
+const CLASS_COLORS: Record<number, string> = {
+  1: '#C79C6E', 2: '#F58CBA', 3: '#ABD473', 4: '#FFF569', 5: '#FFFFFF',
+  6: '#C41F3B', 7: '#0070DE', 8: '#69CCF0', 9: '#9482C9', 11: '#FF7D0A',
+};
+
+// WoW 3.3.5a TalentTab IDs per class (from TalentTab.dbc ClassMask)
+const CLASS_TAB_IDS: Record<number, number[]> = {
+  1: [161, 164, 163],   // Warrior: Arms, Fury, Protection
+  2: [381, 382, 383],   // Paladin: Holy, Protection, Retribution
+  3: [361, 362, 363],   // Hunter: Beast Mastery, Marksmanship, Survival
+  4: [181, 182, 183],   // Rogue: Assassination, Combat, Subtlety
+  5: [201, 202, 203],   // Priest: Discipline, Holy, Shadow
+  6: [398, 399, 400],   // Death Knight: Blood, Frost, Unholy
+  7: [261, 262, 263],   // Shaman: Elemental, Enhancement, Restoration
+  8: [41, 61, 81],      // Mage: Arcane, Fire, Frost
+  9: [301, 302, 303],   // Warlock: Affliction, Demonology, Destruction
+  11: [281, 282, 283],  // Druid: Balance, Feral Combat, Restoration
+};
+
+const COLORS = {
+  bg: '#0d1117',
+  bgLight: '#161b22',
+  bgHover: '#1c2333',
+  border: '#30363d',
+  text: '#c9d1d9',
+  textDim: '#8b949e',
+  textBright: '#f0f6fc',
+  accent: '#58a6ff',
+  green: '#3fb950',
+  red: '#f85149',
+  orange: '#d29922',
+  purple: '#bc8cff',
+  yellow: '#e3b341',
+};
+
+const ROWS = 11; // 0-10
+const COLS = 4;  // 0-3
+
+/* ──────────────────────────────────────────────────────────────────
+ *  Component
+ * ────────────────────────────────────────────────────────────────── */
+
+interface Props {
+  textColor: string;
+  contentBoxColor: string;
+}
+
+export default function TalentTreeEditor({ textColor: _tc, contentBoxColor: _cbc }: Props) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  // Data
+  const [talents, setTalents] = useState<TalentEntry[]>([]);
+  const [tabNames, setTabNames] = useState<Record<number, string>>({});
+  const [rawData, setRawData] = useState<{ fieldDefs: unknown[]; records: (string | number)[][] } | null>(null);
+
+  // UI state
+  const [selectedClass, setSelectedClass] = useState<number>(1);
+  const [selectedTalent, setSelectedTalent] = useState<TalentEntry | null>(null);
+  const [editValues, setEditValues] = useState<Record<string, string | number>>({});
+
+  // ─── Load talent data ─────────────────────────────────────────────
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      // Load Talent.dbc
+      const talentRes = await fetch('/api/dbc/read/Talent.dbc');
+      const talentJson = await talentRes.json();
+      if (!talentRes.ok) throw new Error(talentJson.error);
+
+      setRawData({ fieldDefs: talentJson.fieldDefs, records: talentJson.records });
+
+      // Parse talents
+      const entries: TalentEntry[] = talentJson.records.map((row: number[], idx: number) => ({
+        origIdx: idx,
+        id: row[0],
+        tabId: row[1],
+        row: row[2],
+        col: row[3],
+        spellRanks: row.slice(4, 13),
+        maxRank: row.slice(4, 13).filter((s: number) => s !== 0).length,
+        prereqTalents: row.slice(13, 16),
+        prereqRanks: row.slice(16, 19),
+        flags: row[19],
+        requiredSpellId: row[20],
+        petFlags: row.slice(21, 23),
+      }));
+
+      setTalents(entries);
+
+      // Load TalentTab.dbc for tab names
+      const tabRes = await fetch('/api/dbc/read/TalentTab.dbc');
+      const tabJson = await tabRes.json();
+      if (tabRes.ok) {
+        const names: Record<number, string> = {};
+        for (const row of tabJson.records) {
+          names[row[0]] = String(row[1]); // ID -> Name_enUS
+        }
+        setTabNames(names);
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+  // ─── Organize by class ────────────────────────────────────────────
+  const classData = useMemo((): ClassTabs | null => {
+    const tabIds = CLASS_TAB_IDS[selectedClass];
+    if (!tabIds) return null;
+
+    const tabs: TabInfo[] = tabIds.map(tabId => ({
+      id: tabId,
+      name: tabNames[tabId] || `Tab ${tabId}`,
+      talents: talents
+        .filter(t => t.tabId === tabId)
+        .sort((a, b) => a.row !== b.row ? a.row - b.row : a.col - b.col),
+    }));
+
+    return {
+      className: CLASS_NAMES[selectedClass] || `Class ${selectedClass}`,
+      classId: selectedClass,
+      tabs,
+    };
+  }, [selectedClass, talents, tabNames]);
+
+  // ─── Select a talent for editing ──────────────────────────────────
+  const selectTalent = (talent: TalentEntry) => {
+    setSelectedTalent(talent);
+    setEditValues({
+      row: talent.row,
+      col: talent.col,
+      flags: talent.flags,
+      requiredSpellId: talent.requiredSpellId,
+      ...Object.fromEntries(talent.spellRanks.map((s, i) => [`spellRank_${i}`, s])),
+      ...Object.fromEntries(talent.prereqTalents.map((p, i) => [`prereq_${i}`, p])),
+      ...Object.fromEntries(talent.prereqRanks.map((r, i) => [`prereqRank_${i}`, r])),
+    });
+  };
+
+  // ─── Apply talent edits ──────────────────────────────────────────
+  const applyEdit = () => {
+    if (!selectedTalent) return;
+
+    const updated: TalentEntry = {
+      ...selectedTalent,
+      row: Number(editValues.row) || 0,
+      col: Number(editValues.col) || 0,
+      flags: Number(editValues.flags) || 0,
+      requiredSpellId: Number(editValues.requiredSpellId) || 0,
+      spellRanks: Array.from({ length: 9 }, (_, i) => Number(editValues[`spellRank_${i}`]) || 0),
+      prereqTalents: Array.from({ length: 3 }, (_, i) => Number(editValues[`prereq_${i}`]) || 0),
+      prereqRanks: Array.from({ length: 3 }, (_, i) => Number(editValues[`prereqRank_${i}`]) || 0),
+    };
+    updated.maxRank = updated.spellRanks.filter(s => s !== 0).length;
+
+    setTalents(talents.map(t => t.origIdx === selectedTalent.origIdx ? updated : t));
+    setSelectedTalent(updated);
+    setSaveMsg('Changes applied (click Save All to write to file)');
+  };
+
+  // ─── Add new talent ──────────────────────────────────────────────
+  const addTalent = (tabId: number, row: number, col: number) => {
+    const maxId = Math.max(0, ...talents.map(t => t.id));
+    const newTalent: TalentEntry = {
+      origIdx: talents.length,
+      id: maxId + 1,
+      tabId,
+      row,
+      col,
+      spellRanks: [0, 0, 0, 0, 0, 0, 0, 0, 0],
+      maxRank: 0,
+      prereqTalents: [0, 0, 0],
+      prereqRanks: [0, 0, 0],
+      flags: 0,
+      requiredSpellId: 0,
+      petFlags: [0, 0],
+    };
+
+    setTalents([...talents, newTalent]);
+    selectTalent(newTalent);
+    setSaveMsg(`Added talent ID ${newTalent.id} at row ${row}, col ${col}`);
+  };
+
+  // ─── Delete talent ───────────────────────────────────────────────
+  const deleteTalent = (talent: TalentEntry) => {
+    setTalents(talents.filter(t => t.origIdx !== talent.origIdx));
+    if (selectedTalent?.origIdx === talent.origIdx) setSelectedTalent(null);
+    setSaveMsg(`Deleted talent ID ${talent.id}`);
+  };
+
+  // ─── Save all ────────────────────────────────────────────────────
+  const saveAll = async () => {
+    if (!rawData) return;
+    setSaving(true);
+    setSaveMsg(null);
+
+    try {
+      // Reconstruct records from talent entries
+      const records = talents.map(t => [
+        t.id, t.tabId, t.row, t.col,
+        ...t.spellRanks,
+        ...t.prereqTalents,
+        ...t.prereqRanks,
+        t.flags, t.requiredSpellId,
+        ...t.petFlags,
+      ]);
+
+      const res = await fetch('/api/dbc/save/Talent.dbc', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          records,
+          fieldDefs: rawData.fieldDefs,
+        }),
+      });
+
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error);
+
+      setSaveMsg(`Saved ${result.recordCount} talents to custom-dbc/Talent.dbc`);
+    } catch (err: unknown) {
+      setSaveMsg(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /* ════════════════════════════════════════════════════════════════
+   *  RENDER
+   * ════════════════════════════════════════════════════════════════ */
+
+  if (loading) return <div style={{ padding: 24, color: COLORS.accent }}>Loading talent data...</div>;
+  if (error) return <div style={{ padding: 24, color: COLORS.red }}>Error: {error}</div>;
+
+  const classColor = CLASS_COLORS[selectedClass] || COLORS.text;
+
+  return (
+    <div style={{ fontFamily: "'Segoe UI', system-ui, sans-serif", color: COLORS.text }}>
+      {/* ── Header ──────────────────────────────────────────── */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 12, padding: '12px 0',
+        borderBottom: `1px solid ${COLORS.border}`, marginBottom: 16, flexWrap: 'wrap',
+      }}>
+        <h3 style={{ margin: 0, color: COLORS.textBright }}>Talent Tree Editor</h3>
+        <span style={{ color: COLORS.textDim, fontSize: 12 }}>{talents.length} talents</span>
+        <div style={{ flex: 1 }} />
+        <button onClick={saveAll} disabled={saving} style={btnStyle(COLORS.green)}>
+          {saving ? 'Saving...' : 'Save All'}
+        </button>
+      </div>
+
+      {saveMsg && (
+        <div style={{
+          padding: '6px 12px', marginBottom: 12, fontSize: 12, borderRadius: 6,
+          color: saveMsg.startsWith('Error') ? COLORS.red : COLORS.green,
+          background: saveMsg.startsWith('Error') ? '#2d1418' : '#0d2818',
+        }}>
+          {saveMsg}
+        </div>
+      )}
+
+      {/* ── Class selector ──────────────────────────────────── */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 16, flexWrap: 'wrap' }}>
+        {Object.entries(CLASS_NAMES).map(([id, name]) => {
+          const cid = Number(id);
+          const isActive = cid === selectedClass;
+          return (
+            <button
+              key={id}
+              onClick={() => { setSelectedClass(cid); setSelectedTalent(null); }}
+              style={{
+                padding: '6px 14px',
+                background: isActive ? (CLASS_COLORS[cid] || COLORS.accent) + '33' : 'transparent',
+                color: CLASS_COLORS[cid] || COLORS.text,
+                border: `1px solid ${isActive ? (CLASS_COLORS[cid] || COLORS.accent) : COLORS.border}`,
+                borderRadius: 6,
+                cursor: 'pointer',
+                fontSize: 12,
+                fontWeight: isActive ? 700 : 400,
+              }}
+            >
+              {name}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ── Talent Trees + Editor ──────────────────────────── */}
+      <div style={{ display: 'flex', gap: 16 }}>
+        {/* Trees */}
+        <div style={{ flex: 1, display: 'flex', gap: 12, overflowX: 'auto' }}>
+          {classData?.tabs.map(tab => (
+            <div key={tab.id} style={{
+              background: COLORS.bgLight,
+              border: `1px solid ${COLORS.border}`,
+              borderRadius: 8,
+              padding: 12,
+              minWidth: 200,
+              flex: 1,
+            }}>
+              <div style={{
+                textAlign: 'center', fontWeight: 700, fontSize: 13,
+                color: classColor, marginBottom: 12,
+                borderBottom: `1px solid ${COLORS.border}`, paddingBottom: 8,
+              }}>
+                {tab.name}
+                <span style={{ color: COLORS.textDim, fontWeight: 400, fontSize: 10, marginLeft: 6 }}>
+                  ({tab.talents.length} talents)
+                </span>
+              </div>
+
+              {/* Grid */}
+              <div style={{ display: 'grid', gridTemplateRows: `repeat(${ROWS}, 1fr)`, gap: 4 }}>
+                {Array.from({ length: ROWS }, (_, rowIdx) => (
+                  <div key={rowIdx} style={{
+                    display: 'grid', gridTemplateColumns: `repeat(${COLS}, 1fr)`, gap: 4,
+                  }}>
+                    {Array.from({ length: COLS }, (_, colIdx) => {
+                      const talent = tab.talents.find(t => t.row === rowIdx && t.col === colIdx);
+                      const isSelected = selectedTalent?.id === talent?.id;
+
+                      if (talent) {
+                        return (
+                          <div
+                            key={colIdx}
+                            onClick={() => selectTalent(talent)}
+                            style={{
+                              width: 42,
+                              height: 42,
+                              background: isSelected ? classColor + '44' : COLORS.bgHover,
+                              border: `2px solid ${isSelected ? classColor : COLORS.border}`,
+                              borderRadius: 6,
+                              display: 'flex',
+                              flexDirection: 'column',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              cursor: 'pointer',
+                              fontSize: 9,
+                              color: COLORS.textBright,
+                              position: 'relative',
+                            }}
+                            title={`ID: ${talent.id}, Spell: ${talent.spellRanks[0]}, Ranks: ${talent.maxRank}`}
+                          >
+                            <span style={{ fontWeight: 700, fontSize: 11 }}>{talent.id}</span>
+                            <span style={{ color: COLORS.textDim }}>R{talent.maxRank}</span>
+                            {talent.prereqTalents[0] !== 0 && (
+                              <div style={{
+                                position: 'absolute', top: -2, right: -2,
+                                width: 6, height: 6, borderRadius: 3,
+                                background: COLORS.orange,
+                              }} title={`Requires talent ${talent.prereqTalents[0]}`} />
+                            )}
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div
+                          key={colIdx}
+                          onClick={() => addTalent(tab.id, rowIdx, colIdx)}
+                          style={{
+                            width: 42,
+                            height: 42,
+                            background: 'transparent',
+                            border: `1px dashed ${COLORS.border}`,
+                            borderRadius: 6,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            cursor: 'pointer',
+                            fontSize: 14,
+                            color: COLORS.border,
+                          }}
+                          title={`Add talent at row ${rowIdx}, col ${colIdx}`}
+                        >
+                          +
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* ── Properties panel ────────────────────────────── */}
+        <div style={{
+          width: 320,
+          background: COLORS.bgLight,
+          border: `1px solid ${COLORS.border}`,
+          borderRadius: 8,
+          padding: 16,
+          overflowY: 'auto',
+          maxHeight: 'calc(100vh - 300px)',
+        }}>
+          {selectedTalent ? (
+            <>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                <h4 style={{ margin: 0, color: classColor }}>
+                  Talent #{selectedTalent.id}
+                </h4>
+                <button
+                  onClick={() => deleteTalent(selectedTalent)}
+                  style={{ ...smallBtnStyle, color: COLORS.red, borderColor: COLORS.red + '55' }}
+                >
+                  Delete
+                </button>
+              </div>
+
+              {/* Position */}
+              <FieldGroup label="Position">
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  <LabeledInput label="Tab ID" value={selectedTalent.tabId} disabled />
+                  <LabeledInput label="Tab Name" value={tabNames[selectedTalent.tabId] || '?'} disabled />
+                  <LabeledInput label="Row (Tier)" value={editValues.row} onChange={v => setEditValues({ ...editValues, row: v })} />
+                  <LabeledInput label="Column" value={editValues.col} onChange={v => setEditValues({ ...editValues, col: v })} />
+                </div>
+              </FieldGroup>
+
+              {/* Spell Ranks */}
+              <FieldGroup label={`Spell Ranks (${selectedTalent.maxRank} ranks)`}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4 }}>
+                  {Array.from({ length: 9 }, (_, i) => (
+                    <LabeledInput
+                      key={i}
+                      label={`Rank ${i + 1}`}
+                      value={editValues[`spellRank_${i}`] ?? 0}
+                      onChange={v => setEditValues({ ...editValues, [`spellRank_${i}`]: v })}
+                    />
+                  ))}
+                </div>
+              </FieldGroup>
+
+              {/* Prerequisites */}
+              <FieldGroup label="Prerequisites">
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
+                  {Array.from({ length: 3 }, (_, i) => (
+                    <React.Fragment key={i}>
+                      <LabeledInput
+                        label={`Talent ${i + 1}`}
+                        value={editValues[`prereq_${i}`] ?? 0}
+                        onChange={v => setEditValues({ ...editValues, [`prereq_${i}`]: v })}
+                      />
+                      <LabeledInput
+                        label={`Rank ${i + 1}`}
+                        value={editValues[`prereqRank_${i}`] ?? 0}
+                        onChange={v => setEditValues({ ...editValues, [`prereqRank_${i}`]: v })}
+                      />
+                    </React.Fragment>
+                  ))}
+                </div>
+              </FieldGroup>
+
+              {/* Other */}
+              <FieldGroup label="Other">
+                <LabeledInput label="Flags" value={editValues.flags} onChange={v => setEditValues({ ...editValues, flags: v })} />
+                <LabeledInput label="Required Spell ID" value={editValues.requiredSpellId}
+                  onChange={v => setEditValues({ ...editValues, requiredSpellId: v })} />
+              </FieldGroup>
+
+              <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                <button onClick={applyEdit} style={btnStyle(COLORS.green)}>Apply</button>
+                <button onClick={() => setSelectedTalent(null)} style={btnStyle(COLORS.textDim)}>Deselect</button>
+              </div>
+            </>
+          ) : (
+            <div style={{ color: COLORS.textDim, textAlign: 'center', padding: 32 }}>
+              <div style={{ fontSize: 32, marginBottom: 8 }}>&#9670;</div>
+              <div>Click a talent in the tree to edit it</div>
+              <div style={{ fontSize: 11, marginTop: 4 }}>Click an empty slot (+) to add a new talent</div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Talent Table (compact list) ────────────────────── */}
+      <div style={{ marginTop: 24 }}>
+        <h4 style={{ color: COLORS.textBright, margin: '0 0 8px' }}>
+          All Talents for {CLASS_NAMES[selectedClass]}
+        </h4>
+        <div style={{ maxHeight: 300, overflowY: 'auto', border: `1px solid ${COLORS.border}`, borderRadius: 6 }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+            <thead>
+              <tr>
+                {['ID', 'Tab', 'Row', 'Col', 'Ranks', 'Spell 1', 'Prereq', 'Flags'].map(h => (
+                  <th key={h} style={{
+                    padding: '4px 8px', textAlign: 'left', borderBottom: `2px solid ${COLORS.border}`,
+                    color: COLORS.textBright, fontSize: 10, fontWeight: 600, position: 'sticky', top: 0,
+                    background: COLORS.bgLight,
+                  }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {classData?.tabs.flatMap(tab => tab.talents).map(t => (
+                <tr
+                  key={t.id}
+                  onClick={() => selectTalent(t)}
+                  style={{
+                    cursor: 'pointer',
+                    background: selectedTalent?.id === t.id ? classColor + '22' : 'transparent',
+                  }}
+                >
+                  <td style={tdStyle}>{t.id}</td>
+                  <td style={tdStyle}>{tabNames[t.tabId] || t.tabId}</td>
+                  <td style={tdStyle}>{t.row}</td>
+                  <td style={tdStyle}>{t.col}</td>
+                  <td style={tdStyle}>{t.maxRank}</td>
+                  <td style={tdStyle}>{t.spellRanks[0] || '-'}</td>
+                  <td style={tdStyle}>{t.prereqTalents[0] || '-'}</td>
+                  <td style={tdStyle}>0x{(t.flags >>> 0).toString(16).toUpperCase()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ *  Sub-components
+ * ────────────────────────────────────────────────────────────────── */
+
+function FieldGroup({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ fontSize: 10, fontWeight: 600, color: COLORS.textDim, marginBottom: 4, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+        {label}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function LabeledInput({ label, value, onChange, disabled }: {
+  label: string;
+  value: string | number;
+  onChange?: (val: string | number) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div>
+      <label style={{ fontSize: 9, color: COLORS.textDim, display: 'block' }}>{label}</label>
+      <input
+        value={value}
+        onChange={e => onChange?.(e.target.value)}
+        disabled={disabled}
+        style={{
+          width: '100%',
+          padding: '3px 6px',
+          background: disabled ? COLORS.bgHover : COLORS.bg,
+          color: disabled ? COLORS.textDim : COLORS.text,
+          border: `1px solid ${COLORS.border}`,
+          borderRadius: 4,
+          fontSize: 12,
+          boxSizing: 'border-box',
+          outline: 'none',
+        }}
+      />
+    </div>
+  );
+}
+
+/* ──────────────────────────────────────────────────────────────────
+ *  Styles
+ * ────────────────────────────────────────────────────────────────── */
+
+function btnStyle(color: string): React.CSSProperties {
+  return {
+    padding: '6px 14px',
+    background: color + '22',
+    color,
+    border: `1px solid ${color}55`,
+    borderRadius: 6,
+    cursor: 'pointer',
+    fontSize: 12,
+    fontWeight: 600,
+  };
+}
+
+const smallBtnStyle: React.CSSProperties = {
+  padding: '2px 8px',
+  background: 'transparent',
+  color: COLORS.textDim,
+  border: `1px solid ${COLORS.border}`,
+  borderRadius: 4,
+  cursor: 'pointer',
+  fontSize: 10,
+};
+
+const tdStyle: React.CSSProperties = {
+  padding: '3px 8px',
+  borderBottom: `1px solid ${COLORS.border}`,
+  color: COLORS.text,
+};

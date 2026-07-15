@@ -1,0 +1,28 @@
+#!/bin/bash
+# webserver restarter for mod-sdbeditor
+# Kills processes on ports 5173, 3001, 5000 and restarts dev, server, and starter
+
+set -e
+cd "$(dirname "$0")"
+
+WEB_DIR="$(pwd)"
+
+# Kill processes on ports
+for port in 5173 3001 5000; do
+  fuser -k ${port}/tcp 2>/dev/null || true
+done
+
+# Start all servers in background, log output
+(
+  cd "$WEB_DIR"
+  echo "Starting: npm run dev"
+  npm run dev &> web-dev.log &
+  sleep 2
+  echo "Starting: npm run server"
+  npm run server &> web-server.log &
+  sleep 2
+  echo "Starting: npm run starter"
+  npm run starter &> web-starter.log &
+)
+
+echo "All web servers restarted. Logs: web-dev.log, web-server.log, web-starter.log"

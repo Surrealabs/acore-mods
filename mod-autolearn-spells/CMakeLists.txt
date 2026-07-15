@@ -1,0 +1,2 @@
+AC_ADD_SCRIPT(src/mod_autolearn_spells.cpp)
+AC_ADD_SCRIPT(src/mod_autolearn_spells_loader.cpp)

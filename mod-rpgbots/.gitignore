@@ -1,0 +1,26 @@
+# Ignore build and temp files
+/build/
+/bin/
+/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.so
+*.a
+*.exe
+*.log
+*.tmp
+*.swp
+*.swo
+*.user
+*.db
+*.sqlite
+*.sdf
+*.suo
+*.ncb
+*.vcxproj*
+*.DS_Store
+*.idea/
+*.vscode/

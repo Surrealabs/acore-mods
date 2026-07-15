@@ -1,0 +1,15 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.obj
+*.log
+
+# OS/IDE
+.DS_Store
+*.user
+*.suo
+.vscode/
+
+# Node
+node_modules/

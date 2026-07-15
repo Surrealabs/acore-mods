@@ -1,0 +1,16 @@
+[Unit]
+Description=SDBEditor Starter/Auth Service (port 5000)
+After=network.target mysql.service mariadb.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/azerothcore-wotlk/modules/mod-sdbeditor/web
+ExecStart=/usr/bin/node starter-server.js
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/var/log/sdbeditor-starter.log
+StandardError=append:/var/log/sdbeditor-starter.log
+
+[Install]
+WantedBy=multi-user.target

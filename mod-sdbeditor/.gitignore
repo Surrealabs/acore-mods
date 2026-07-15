@@ -1,0 +1,90 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+# Public data folders (large icon/DBC/generated files, not needed in version control)
+# Ignore all contents but keep directory structure via .gitkeep files
+
+# DBC files (base + custom)
+web/public/dbc/*
+!web/public/dbc/.gitkeep
+web/public/custom-dbc/*
+!web/public/custom-dbc/.gitkeep
+
+# Icon files (base + custom)
+web/public/icon/*
+!web/public/icon/.gitkeep
+web/public/custom-icon/*
+!web/public/custom-icon/.gitkeep
+
+# Generated thumbnails
+web/public/thumbnails/*
+!web/public/thumbnails/.gitkeep
+
+# Generated sprite sheets
+web/public/sprites/*
+!web/public/sprites/.gitkeep
+
+# Export output
+web/public/export/DBFilesClient/*
+!web/public/export/DBFilesClient/.gitkeep
+web/public/export/Interface/*
+!web/public/export/Interface/.gitkeep
+
+# Error logs
+web/public/error-logs/*
+!web/public/error-logs/.gitkeep
+
+# Generated index/manifest files
+web/public/spell-icon-index.json
+web/public/icon-manifest.json
+web/public/icons-manifest.json
+web/public/config.json
+
+# User-uploaded assets (keep defaults)
+web/public/background-image.png
+web/public/header-image.png
+web/public/page-icon.ico
+web/public/page-icon.png
+
+# Server logs
+web/web-dev.log
+web/web-server.log
+web/web-starter.log
+
+# Legacy paths (for backwards compatibility)
+public/custom_dbc/
+public/custom_icon/
+public/DBC_335_wotlk/
+public/INT_335_wotlk/
+base-icons-manifest.json
+web/starter-config.json
+web/starter-settings.json
+public/custom-icons/
+public/custom-dbc/
+public/icons/
+public/icons-dbc/
+public/export/
+# Generated runtime data (daily DBC backups, user exports)
+backups/
+export/

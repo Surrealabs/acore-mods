@@ -1,0 +1,36 @@
+[worldserver]
+
+###################################################################################################
+#     RPGBots Module Configuration
+###################################################################################################
+
+#
+#    RPGBots.Psych.Enable
+#        Description: Enable the Psychology and Temperament system.
+#                     When disabled, .rpg psych and .rpg temperament commands do nothing,
+#                     and no psych/temperament auras are applied to bots.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+#
+
+RPGBots.Psych.Enable = 0
+
+#
+#    RPGBots.SelfBot.Enable
+#        Description: Allow players to use .rpg selfbot to let the AI control
+#                     their own character.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+#
+
+RPGBots.SelfBot.Enable = 1
+
+#
+#    RPGBots.AltArmy.MaxBots
+#        Description: Maximum number of bot alts a player can have logged in
+#                     simultaneously via the Army of Alts system.
+#        Default:     4
+#
+
+RPGBots.AltArmy.MaxBots = 4
+

@@ -1,0 +1,16 @@
+[Unit]
+Description=SDBEditor Backend File/API Service (port 3001)
+After=network.target mysql.service mariadb.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/azerothcore-wotlk/modules/mod-sdbeditor/web
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/var/log/sdbeditor-api.log
+StandardError=append:/var/log/sdbeditor-api.log
+
+[Install]
+WantedBy=multi-user.target
