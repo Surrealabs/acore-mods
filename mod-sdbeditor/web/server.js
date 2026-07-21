@@ -859,10 +859,11 @@ async function buildSqlOnlySpellDetails(spellId) {
 
   const overrides = buildCustomSpellOverrides(customRow);
   const editable = buildOrderedEditableFromOverrides(overrides);
+  const spellIconId = Number(overrides.SpellIconID || editable.icon?.SpellIconID || 0);
   const details = {
     spellId,
-    spellIconId: Number(overrides.SpellIconID || editable.icon?.SpellIconID || 0),
-    icon: null,
+    spellIconId,
+    icon: await getSpellIconNameById(spellIconId),
     name: String(overrides.SpellName || customRow.SpellName0 || `Spell ${spellId}`),
     rank: String(overrides.Rank || customRow.SpellRank0 || ''),
     description: String(overrides.Description || customRow.SpellDescription0 || ''),
@@ -1254,6 +1255,102 @@ function invalidateSpellCaches() {
   dbcCache.spellNameIndex = null;
   dbcCache.spellIconIndex = null;
   dbcCache.lastModified.spellDbc = 0;
+}
+
+// Locstring/localized fields need string-block growth to edit safely - not
+// attempted here. Everything else in SPELL_EDITABLE_FIELDS is a plain
+// 4-byte numeric/flag/reference column, safe for a raw offset patch.
+const SPELL_DBC_STRING_FIELDS = new Set(['SpellName', 'Rank', 'Description', 'ToolTip']);
+
+// Patch numeric Spell.dbc fields directly into the binary file from a
+// SQL-sourced fields patch, so the SQL editor's saves actually make it into
+// the exported/live DBC (previously the SQL `sdbeditor.spell` table was the
+// only thing that got updated - the binary Spell.dbc never changed at all,
+// so exports always served stale data no matter what was edited).
+//
+// Per the modify-client-spell-visuals skill, Spell.dbc (234 partially-named
+// fields) is NEVER safe for a full readDBC()->mutate->writeDBC() round trip.
+// This only ever raw-patches the exact 4-byte slots it touches, on a buffer
+// freshly read via fs.readFileSync, and never reserializes the whole file.
+// readDBC() is used ONLY to locate fieldDefs/record index - not to rebuild
+// or write anything.
+function patchSpellDbcFromSql(spellId, fieldsPatch) {
+  const numericPatch = {};
+  for (const [field, value] of Object.entries(fieldsPatch || {})) {
+    if (SPELL_DBC_STRING_FIELDS.has(field)) continue;
+    numericPatch[field] = value;
+  }
+  if (!Object.keys(numericPatch).length) {
+    return { patched: false, reason: 'no-numeric-fields' };
+  }
+
+  const liveDbcPath = path.join(SERVER_DBC_DIR, 'Spell.dbc');
+  if (!fs.existsSync(liveDbcPath)) {
+    return { patched: false, reason: 'spell-dbc-not-found' };
+  }
+
+  let spellData;
+  try {
+    spellData = readDBC(liveDbcPath);
+  } catch (err) {
+    return { patched: false, reason: `read-failed: ${err.message}` };
+  }
+
+  const idFieldIdx = getFieldIndex(spellData.fieldDefs, 'ID');
+  if (idFieldIdx === -1) return { patched: false, reason: 'no-id-field' };
+
+  let recordIndex = -1;
+  for (let i = 0; i < spellData.records.length; i++) {
+    if (Number(spellData.records[i][idFieldIdx]) === Number(spellId)) {
+      recordIndex = i;
+      break;
+    }
+  }
+  if (recordIndex === -1) {
+    return { patched: false, reason: 'spell-not-in-dbc' };
+  }
+
+  backupDbcOnce(liveDbcPath, 'pre-sql-field-patch');
+
+  const buffer = fs.readFileSync(liveDbcPath);
+  const recordCount = buffer.readUInt32LE(4);
+  const recordSize = buffer.readUInt32LE(12);
+  const headerSize = 20;
+  const recordsEnd = headerSize + recordCount * recordSize;
+  const recordOffset = headerSize + recordIndex * recordSize;
+
+  const changedFields = [];
+  const skippedFields = [];
+  for (const [fieldName, rawValue] of Object.entries(numericPatch)) {
+    const fieldIdx = getFieldIndex(spellData.fieldDefs, fieldName);
+    if (fieldIdx === -1) {
+      skippedFields.push(fieldName);
+      continue;
+    }
+    const byteOffset = recordOffset + fieldIdx * 4;
+    if (byteOffset + 4 > recordsEnd) {
+      skippedFields.push(fieldName);
+      continue;
+    }
+    buffer.writeUInt32LE(toSigned32(rawValue) >>> 0, byteOffset);
+    changedFields.push(fieldName);
+  }
+
+  if (!changedFields.length) {
+    return { patched: false, reason: 'no-fields-matched', skippedFields };
+  }
+
+  fs.writeFileSync(liveDbcPath, buffer);
+
+  // Keep the client export staging copy (what /api/spells/export serves,
+  // and what resolveDbcPath() prefers once it exists) in sync too.
+  const exportDbcDir = path.join(EXPORT_DIR, 'DBFilesClient');
+  if (!fs.existsSync(exportDbcDir)) fs.mkdirSync(exportDbcDir, { recursive: true });
+  fs.copyFileSync(liveDbcPath, path.join(exportDbcDir, 'Spell.dbc'));
+
+  invalidateSpellCaches();
+
+  return { patched: true, changedFields, skippedFields, recordIndex };
 }
 
 function buildSpellIconIndex(config) {
@@ -3783,6 +3880,13 @@ app.put('/api/spells/:spellId/edit', async (req, res) => {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
+    let dbcPatch;
+    try {
+      dbcPatch = patchSpellDbcFromSql(spellId, normalizedFields);
+    } catch (err) {
+      dbcPatch = { patched: false, reason: `patch-threw: ${err.message}` };
+    }
+
     const details = await buildSqlOnlySpellDetails(spellId);
 
     return res.json({
@@ -3791,6 +3895,7 @@ app.put('/api/spells/:spellId/edit', async (req, res) => {
       updatedFields: mirrorResult.columns,
       skipped: [],
       mirror: mirrorResult,
+      dbcPatch,
       details,
     });
   } catch (error) {
@@ -3845,6 +3950,19 @@ app.post('/api/spells/create-from-template', async (req, res) => {
 
     const mirrorResult = await mirrorSpellToCustomTable(newSpellId, normalizeSpellPatchFields(fields || {}))
       .catch(() => ({ mirrored: false, reason: 'mirror-failed' }));
+
+    // Best-effort only: a brand-new spell ID has no existing Spell.dbc
+    // record to patch fields into (that would require appending a whole new
+    // record, a separate/riskier operation not attempted here) - so this
+    // will correctly report 'spell-not-in-dbc' for genuinely new IDs rather
+    // than silently claiming success.
+    let dbcPatch;
+    try {
+      dbcPatch = patchSpellDbcFromSql(newSpellId, normalizeSpellPatchFields(fields || {}));
+    } catch (err) {
+      dbcPatch = { patched: false, reason: `patch-threw: ${err.message}` };
+    }
+
     const details = await buildSqlOnlySpellDetails(newSpellId);
 
     return res.json({
@@ -3854,6 +3972,7 @@ app.post('/api/spells/create-from-template', async (req, res) => {
       updatedFields: mirrorResult?.columns || [],
       skipped: [],
       mirror: { created: insertResult, patch: mirrorResult },
+      dbcPatch,
       details,
     });
   } catch (error) {
@@ -3930,6 +4049,16 @@ app.post('/api/spells/batch-edit', async (req, res) => {
       return res.status(400).json({ error: 'No spells updated', missing, skipped: [] });
     }
 
+    const dbcPatchResults = ids
+      .filter((id) => existingIds.has(id))
+      .map((spellId) => {
+        try {
+          return { spellId, ...patchSpellDbcFromSql(spellId, normalizedFields) };
+        } catch (err) {
+          return { spellId, patched: false, reason: `patch-threw: ${err.message}` };
+        }
+      });
+
     return res.json({
       success: true,
       updatedSpells,
@@ -3938,6 +4067,7 @@ app.post('/api/spells/batch-edit', async (req, res) => {
       missing,
       skipped: [],
       mirror: mirrorResults,
+      dbcPatch: dbcPatchResults,
     });
   } catch (error) {
     console.error('Error applying spell SQL batch edit:', error);
@@ -4699,6 +4829,29 @@ function iconIndexKeyFromSqlName(input) {
 
 function buildSpellIconSqlPath(baseName) {
   return `Interface\\Icons\\${baseName}`;
+}
+
+// Resolve a single SpellIconID -> normalized icon base name via the
+// sdbeditor.spellicon SQL mirror. Used so the editor's own preview reflects
+// an in-progress SpellIconID edit immediately, without needing a full
+// DBC/index rebuild first (spellIconIndex is only rebuilt from the binary
+// Spell.dbc/SpellIcon.dbc, or via the explicit sync workflow).
+async function getSpellIconNameById(spellIconId) {
+  const id = Number(spellIconId);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  try {
+    const rows = await withCustomSpellConnection(async (conn) => {
+      const [r] = await conn.query(
+        `SELECT \`Name\` AS iconName FROM \`${CUSTOM_SPELL_DB}\`.\`spellicon\` WHERE \`ID\` = ? LIMIT 1`,
+        [id]
+      );
+      return r;
+    });
+    const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+    return row ? iconIndexKeyFromSqlName(row.iconName) : null;
+  } catch {
+    return null;
+  }
 }
 
 // Build the spellId -> iconBaseName map directly from sdbeditor SQL
