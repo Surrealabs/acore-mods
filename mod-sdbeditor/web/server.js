@@ -725,13 +725,41 @@ async function loadCustomSpellSchema() {
   return result;
 }
 
+// Reverse of CUSTOM_SPELL_FIELD_ALIASES (declared further below) for the
+// handful of normalized field names whose sdbeditor.spell column name
+// doesn't normalize to the same string (e.g. 'ToolTip' -> 'SpellToolTip0').
+// Without this, mirrorSpellToCustomTable's plain normalizeFieldName()
+// match silently drops SpellName/Rank/Description/ToolTip edits (and a few
+// renamed numeric fields), since e.g. normalizeFieldName('ToolTip') ===
+// 'tooltip' but normalizeFieldName('SpellToolTip0') === 'spelltooltip0' -
+// they never match, so those saves get excluded from `mapped`, and if it's
+// the only field being edited the whole request fails with "No valid
+// fields to update" even though the field name is perfectly valid.
+const CUSTOM_SPELL_COLUMN_ALIASES_REVERSE = {
+  SpellName: 'SpellName0',
+  Rank: 'SpellRank0',
+  Description: 'SpellDescription0',
+  ToolTip: 'SpellToolTip0',
+  MaximumLevel: 'MaxLevel',
+  MaximumTargetLevel: 'MaxTargetLevel',
+  MaximumAffectedTargets: 'MaxAffectedTargets',
+  Dispel: 'DispelType',
+  DamageClass: 'DmgClass',
+  PowerDisplayId: 'PowerDisplayID',
+  SpellVisual1: 'SpellVisualID1',
+  SpellVisual2: 'SpellVisualID2',
+};
+
 async function mirrorSpellToCustomTable(spellId, fieldsPatch) {
   const schema = await loadCustomSpellSchema();
   if (!schema) return { mirrored: false, reason: 'custom-spell-schema-missing' };
 
   const mapped = {};
   for (const [field, value] of Object.entries(fieldsPatch || {})) {
-    const actualColumn = schema.normalizedToActual[normalizeFieldName(field)];
+    const aliasColumn = CUSTOM_SPELL_COLUMN_ALIASES_REVERSE[field];
+    const actualColumn = (aliasColumn && schema.normalizedToActual[normalizeFieldName(aliasColumn)] === aliasColumn)
+      ? aliasColumn
+      : schema.normalizedToActual[normalizeFieldName(field)];
     if (!actualColumn) continue;
     mapped[actualColumn] = value;
   }
@@ -1257,31 +1285,54 @@ function invalidateSpellCaches() {
   dbcCache.lastModified.spellDbc = 0;
 }
 
-// Locstring/localized fields need string-block growth to edit safely - not
-// attempted here. Everything else in SPELL_EDITABLE_FIELDS is a plain
-// 4-byte numeric/flag/reference column, safe for a raw offset patch.
+// Locstring/localized text fields (SpellName/Rank/Description/ToolTip).
+// These need string-block growth to edit, handled separately below from
+// the plain 4-byte numeric/flag/reference fields.
 const SPELL_DBC_STRING_FIELDS = new Set(['SpellName', 'Rank', 'Description', 'ToolTip']);
 
-// Patch numeric Spell.dbc fields directly into the binary file from a
-// SQL-sourced fields patch, so the SQL editor's saves actually make it into
-// the exported/live DBC (previously the SQL `sdbeditor.spell` table was the
+// Return every locale-slot field index (enUS + the 15 other locale slots,
+// but NOT the trailing `${baseName}_Flags` field) for a locString group
+// like SpellName/Rank/Description/ToolTip, using the `type`/`locale`
+// metadata dbc-definitions.js's locString() helper attaches to each slot.
+function getSpellLocaleFieldIndices(fieldDefs, baseName) {
+  return fieldDefs
+    .map((fd, idx) => ({ fd, idx }))
+    .filter(({ fd }) => fd && fd.type === 'string' && fd.locale
+      && (fd.name === baseName || fd.name === `${baseName}_${fd.locale}`))
+    .map(({ idx }) => idx);
+}
+
+// Patch Spell.dbc fields directly into the binary file from a SQL-sourced
+// fields patch, so the SQL editor's saves actually make it into the
+// exported/live DBC (previously the SQL `sdbeditor.spell` table was the
 // only thing that got updated - the binary Spell.dbc never changed at all,
 // so exports always served stale data no matter what was edited).
 //
 // Per the modify-client-spell-visuals skill, Spell.dbc (234 partially-named
 // fields) is NEVER safe for a full readDBC()->mutate->writeDBC() round trip.
-// This only ever raw-patches the exact 4-byte slots it touches, on a buffer
-// freshly read via fs.readFileSync, and never reserializes the whole file.
+// Two kinds of edits are handled, both still just targeted patches rather
+// than a full rebuild:
+//   1. Plain 4-byte numeric/flag/reference fields - raw-patched in place on
+//      a buffer freshly read via fs.readFileSync.
+//   2. Locstring text fields (SpellName/Rank/Description/ToolTip) - these
+//      need new bytes added to the string block. Since the string block is
+//      always the LAST section of the file, appending new string bytes at
+//      the true end of the file never shifts any existing record or string
+//      data. Each edited field gets its text appended once, then every
+//      locale slot for that field is pointed at the new offset (so the
+//      text shows regardless of the client's locale), and the header's
+//      stringBlockSize is bumped by the appended length.
 // readDBC() is used ONLY to locate fieldDefs/record index - not to rebuild
 // or write anything.
 function patchSpellDbcFromSql(spellId, fieldsPatch) {
   const numericPatch = {};
+  const stringPatch = {};
   for (const [field, value] of Object.entries(fieldsPatch || {})) {
-    if (SPELL_DBC_STRING_FIELDS.has(field)) continue;
-    numericPatch[field] = value;
+    if (SPELL_DBC_STRING_FIELDS.has(field)) stringPatch[field] = value;
+    else numericPatch[field] = value;
   }
-  if (!Object.keys(numericPatch).length) {
-    return { patched: false, reason: 'no-numeric-fields' };
+  if (!Object.keys(numericPatch).length && !Object.keys(stringPatch).length) {
+    return { patched: false, reason: 'no-fields' };
   }
 
   const liveDbcPath = path.join(SERVER_DBC_DIR, 'Spell.dbc');
@@ -1312,7 +1363,7 @@ function patchSpellDbcFromSql(spellId, fieldsPatch) {
 
   backupDbcOnce(liveDbcPath, 'pre-sql-field-patch');
 
-  const buffer = fs.readFileSync(liveDbcPath);
+  let buffer = fs.readFileSync(liveDbcPath);
   const recordCount = buffer.readUInt32LE(4);
   const recordSize = buffer.readUInt32LE(12);
   const headerSize = 20;
@@ -1334,6 +1385,38 @@ function patchSpellDbcFromSql(spellId, fieldsPatch) {
     }
     buffer.writeUInt32LE(toSigned32(rawValue) >>> 0, byteOffset);
     changedFields.push(fieldName);
+  }
+
+  if (Object.keys(stringPatch).length) {
+    let stringBlockSize = buffer.readUInt32LE(16);
+    let appendOffset = stringBlockSize;
+    const appendedChunks = [];
+    const localePatches = [];
+
+    for (const [fieldName, rawValue] of Object.entries(stringPatch)) {
+      const localeIndices = getSpellLocaleFieldIndices(spellData.fieldDefs, fieldName);
+      if (!localeIndices.length) {
+        skippedFields.push(fieldName);
+        continue;
+      }
+      const text = String(rawValue ?? '');
+      const strBytes = Buffer.concat([Buffer.from(text, 'utf8'), Buffer.from([0])]);
+      const thisOffset = appendOffset;
+      appendedChunks.push(strBytes);
+      appendOffset += strBytes.length;
+      for (const fieldIdx of localeIndices) {
+        localePatches.push({ byteOffset: recordOffset + fieldIdx * 4, offset: thisOffset });
+      }
+      changedFields.push(fieldName);
+    }
+
+    if (appendedChunks.length) {
+      buffer = Buffer.concat([buffer, ...appendedChunks]);
+      buffer.writeUInt32LE(appendOffset, 16); // grow header's stringBlockSize
+      for (const { byteOffset, offset } of localePatches) {
+        buffer.writeUInt32LE(offset, byteOffset);
+      }
+    }
   }
 
   if (!changedFields.length) {
