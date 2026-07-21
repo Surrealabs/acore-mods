@@ -748,6 +748,13 @@ const CUSTOM_SPELL_COLUMN_ALIASES_REVERSE = {
   PowerDisplayId: 'PowerDisplayID',
   SpellVisual1: 'SpellVisualID1',
   SpellVisual2: 'SpellVisualID2',
+  // SpellFamilyFlags_1/_2/_3 (real DBC field names) map to bare-then-
+  // suffixed sdbeditor.spell columns (SpellFamilyFlags/1/2), not the usual
+  // "same digit suffix on both sides" pattern every other Effect*/Reagent*/
+  // Totem* field follows.
+  SpellFamilyFlags1: 'SpellFamilyFlags',
+  SpellFamilyFlags2: 'SpellFamilyFlags1',
+  SpellFamilyFlags3: 'SpellFamilyFlags2',
 };
 
 async function mirrorSpellToCustomTable(spellId, fieldsPatch) {
@@ -1436,6 +1443,192 @@ function patchSpellDbcFromSql(spellId, fieldsPatch) {
   invalidateSpellCaches();
 
   return { patched: true, changedFields, skippedFields, recordIndex };
+}
+
+// Append a brand-new, all-zero-except-ID record to the live Spell.dbc (and
+// its client export copy) for a spell ID that has no binary record at all
+// yet. "Copy Spell"/"Create From Template" only ever wrote to the SQL
+// mirror (sdbeditor.spell) - the binary file the worldserver actually
+// loads at boot, and the DBC the client reads for icon/name lookup, never
+// got a row for genuinely new IDs, so brand-new custom spells appeared to
+// do nothing in-game and showed no icon even though the SQL editor showed
+// them as fully configured.
+//
+// This does NOT do a full readDBC()->mutate->writeDBC() round trip (that
+// corrupted Spell.dbc once in this fork's history - see the
+// modify-client-spell-visuals skill). It only ever APPENDS: a fixed-size
+// all-zero record is spliced in right before the string block (which is
+// always the file's last section), recordCount is bumped, and nothing
+// about any existing record's bytes changes. Follow immediately with
+// patchSpellDbcFromSql(spellId, buildFullSpellFieldsPatchFromRow(row)) to
+// actually populate the new record's fields.
+function appendBlankSpellDbcRecord(spellId) {
+  const liveDbcPath = path.join(SERVER_DBC_DIR, 'Spell.dbc');
+  if (!fs.existsSync(liveDbcPath)) {
+    return { appended: false, reason: 'spell-dbc-not-found' };
+  }
+
+  let spellData;
+  try {
+    spellData = readDBC(liveDbcPath);
+  } catch (err) {
+    return { appended: false, reason: `read-failed: ${err.message}` };
+  }
+
+  const idFieldIdx = getFieldIndex(spellData.fieldDefs, 'ID');
+  if (idFieldIdx === -1) return { appended: false, reason: 'no-id-field' };
+
+  const alreadyExists = spellData.records.some((r) => Number(r[idFieldIdx]) === Number(spellId));
+  if (alreadyExists) return { appended: false, reason: 'already-exists' };
+
+  backupDbcOnce(liveDbcPath, 'pre-append-new-record');
+
+  const buffer = fs.readFileSync(liveDbcPath);
+  const recordCount = buffer.readUInt32LE(4);
+  const recordSize = buffer.readUInt32LE(12);
+  const headerSize = 20;
+  const recordsEnd = headerSize + recordCount * recordSize;
+
+  const newRecord = Buffer.alloc(recordSize); // all-zero except ID below
+  newRecord.writeUInt32LE(Number(spellId) >>> 0, idFieldIdx * 4);
+
+  const newBuffer = Buffer.concat([
+    buffer.subarray(0, recordsEnd),
+    newRecord,
+    buffer.subarray(recordsEnd),
+  ]);
+  newBuffer.writeUInt32LE(recordCount + 1, 4); // bump header.recordCount
+
+  fs.writeFileSync(liveDbcPath, newBuffer);
+
+  const exportDbcDir = path.join(EXPORT_DIR, 'DBFilesClient');
+  if (!fs.existsSync(exportDbcDir)) fs.mkdirSync(exportDbcDir, { recursive: true });
+  fs.copyFileSync(liveDbcPath, path.join(exportDbcDir, 'Spell.dbc'));
+
+  invalidateSpellCaches();
+
+  return { appended: true, newRecordCount: recordCount + 1 };
+}
+
+// sdbeditor.spell SQL column -> real Spell.dbc field name (as named in
+// dbc-definitions.js), for every column that has a genuine 1:1 binary
+// counterpart. `null` = no direct DBC source (locale slots 1-8 have no
+// real per-row data - only slot 0/enUS does). This is the authoritative
+// mapping (verified against the live binary Spell.dbc, same table used by
+// the sync-custom-dbc-to-sql skill's build_sdbeditor_spell_sync.mjs) - do
+// NOT rebuild this by guessing at name normalization, several columns
+// (DispelType/MaxLevel/MaxTargetLevel/MaxAffectedTargets/DmgClass/
+// MinFactionID/MinReputation) already match their real DBC field name
+// exactly while others (SpellVisualID1/2, SpellFamilyFlags/1/2,
+// PowerDisplayID) do not.
+const SPELL_SQL_COLUMN_TO_DBC_FIELD_MAP = [
+  ['ID', 'ID'], ['Category', 'Category'], ['Dispel', 'DispelType'], ['Mechanic', 'Mechanic'],
+  ['Attributes', 'Attributes'], ['AttributesEx', 'AttributesEx'], ['AttributesEx2', 'AttributesEx2'],
+  ['AttributesEx3', 'AttributesEx3'], ['AttributesEx4', 'AttributesEx4'], ['AttributesEx5', 'AttributesEx5'],
+  ['AttributesEx6', 'AttributesEx6'], ['AttributesEx7', 'AttributesEx7'],
+  ['Stances', 'Stances'], ['Unknown1', 'Stances_2'], ['StancesNot', 'StancesNot'], ['Unknown2', 'StancesNot_2'],
+  ['Targets', 'Targets'], ['TargetCreatureType', 'TargetCreatureType'], ['RequiresSpellFocus', 'RequiresSpellFocus'],
+  ['FacingCasterFlags', 'FacingCasterFlags'], ['CasterAuraState', 'CasterAuraState'], ['TargetAuraState', 'TargetAuraState'],
+  ['CasterAuraStateNot', 'CasterAuraStateNot'], ['TargetAuraStateNot', 'TargetAuraStateNot'],
+  ['CasterAuraSpell', 'CasterAuraSpell'], ['TargetAuraSpell', 'TargetAuraSpell'],
+  ['ExcludeCasterAuraSpell', 'ExcludeCasterAuraSpell'], ['ExcludeTargetAuraSpell', 'ExcludeTargetAuraSpell'],
+  ['CastingTimeIndex', 'CastingTimeIndex'], ['RecoveryTime', 'RecoveryTime'], ['CategoryRecoveryTime', 'CategoryRecoveryTime'],
+  ['InterruptFlags', 'InterruptFlags'], ['AuraInterruptFlags', 'AuraInterruptFlags'], ['ChannelInterruptFlags', 'ChannelInterruptFlags'],
+  ['ProcFlags', 'ProcFlags'], ['ProcChance', 'ProcChance'], ['ProcCharges', 'ProcCharges'],
+  ['MaximumLevel', 'MaxLevel'], ['BaseLevel', 'BaseLevel'], ['SpellLevel', 'SpellLevel'],
+  ['DurationIndex', 'DurationIndex'], ['PowerType', 'PowerType'], ['ManaCost', 'ManaCost'],
+  ['ManaCostPerLevel', 'ManaCostPerLevel'], ['ManaPerSecond', 'ManaPerSecond'], ['ManaPerSecondPerLevel', 'ManaPerSecondPerLevel'],
+  ['RangeIndex', 'RangeIndex'], ['Speed', 'Speed'], ['ModalNextSpell', 'ModalNextSpell'], ['StackAmount', 'StackAmount'],
+  ['Totem1', 'Totem_1'], ['Totem2', 'Totem_2'],
+  ['Reagent1', 'Reagent_1'], ['Reagent2', 'Reagent_2'], ['Reagent3', 'Reagent_3'], ['Reagent4', 'Reagent_4'],
+  ['Reagent5', 'Reagent_5'], ['Reagent6', 'Reagent_6'], ['Reagent7', 'Reagent_7'], ['Reagent8', 'Reagent_8'],
+  ['ReagentCount1', 'ReagentCount_1'], ['ReagentCount2', 'ReagentCount_2'], ['ReagentCount3', 'ReagentCount_3'], ['ReagentCount4', 'ReagentCount_4'],
+  ['ReagentCount5', 'ReagentCount_5'], ['ReagentCount6', 'ReagentCount_6'], ['ReagentCount7', 'ReagentCount_7'], ['ReagentCount8', 'ReagentCount_8'],
+  ['EquippedItemClass', 'EquippedItemClass'], ['EquippedItemSubClassMask', 'EquippedItemSubClassMask'],
+  ['EquippedItemInventoryTypeMask', 'EquippedItemInventoryTypeMask'],
+  ['Effect1', 'Effect_1'], ['Effect2', 'Effect_2'], ['Effect3', 'Effect_3'],
+  ['EffectDieSides1', 'EffectDieSides_1'], ['EffectDieSides2', 'EffectDieSides_2'], ['EffectDieSides3', 'EffectDieSides_3'],
+  ['EffectRealPointsPerLevel1', 'EffectRealPointsPerLevel_1'], ['EffectRealPointsPerLevel2', 'EffectRealPointsPerLevel_2'], ['EffectRealPointsPerLevel3', 'EffectRealPointsPerLevel_3'],
+  ['EffectBasePoints1', 'EffectBasePoints_1'], ['EffectBasePoints2', 'EffectBasePoints_2'], ['EffectBasePoints3', 'EffectBasePoints_3'],
+  ['EffectMechanic1', 'EffectMechanic_1'], ['EffectMechanic2', 'EffectMechanic_2'], ['EffectMechanic3', 'EffectMechanic_3'],
+  ['EffectImplicitTargetA1', 'EffectImplicitTargetA_1'], ['EffectImplicitTargetA2', 'EffectImplicitTargetA_2'], ['EffectImplicitTargetA3', 'EffectImplicitTargetA_3'],
+  ['EffectImplicitTargetB1', 'EffectImplicitTargetB_1'], ['EffectImplicitTargetB2', 'EffectImplicitTargetB_2'], ['EffectImplicitTargetB3', 'EffectImplicitTargetB_3'],
+  ['EffectRadiusIndex1', 'EffectRadiusIndex_1'], ['EffectRadiusIndex2', 'EffectRadiusIndex_2'], ['EffectRadiusIndex3', 'EffectRadiusIndex_3'],
+  ['EffectApplyAuraName1', 'EffectApplyAuraName_1'], ['EffectApplyAuraName2', 'EffectApplyAuraName_2'], ['EffectApplyAuraName3', 'EffectApplyAuraName_3'],
+  ['EffectAmplitude1', 'EffectAmplitude_1'], ['EffectAmplitude2', 'EffectAmplitude_2'], ['EffectAmplitude3', 'EffectAmplitude_3'],
+  ['EffectMultipleValue1', 'EffectMultipleValue_1'], ['EffectMultipleValue2', 'EffectMultipleValue_2'], ['EffectMultipleValue3', 'EffectMultipleValue_3'],
+  ['EffectChainTarget1', 'EffectChainTarget_1'], ['EffectChainTarget2', 'EffectChainTarget_2'], ['EffectChainTarget3', 'EffectChainTarget_3'],
+  ['EffectItemType1', 'EffectItemType_1'], ['EffectItemType2', 'EffectItemType_2'], ['EffectItemType3', 'EffectItemType_3'],
+  ['EffectMiscValue1', 'EffectMiscValue_1'], ['EffectMiscValue2', 'EffectMiscValue_2'], ['EffectMiscValue3', 'EffectMiscValue_3'],
+  ['EffectMiscValueB1', 'EffectMiscValueB_1'], ['EffectMiscValueB2', 'EffectMiscValueB_2'], ['EffectMiscValueB3', 'EffectMiscValueB_3'],
+  ['EffectTriggerSpell1', 'EffectTriggerSpell_1'], ['EffectTriggerSpell2', 'EffectTriggerSpell_2'], ['EffectTriggerSpell3', 'EffectTriggerSpell_3'],
+  ['EffectPointsPerComboPoint1', 'EffectPointsPerComboPoint_1'], ['EffectPointsPerComboPoint2', 'EffectPointsPerComboPoint_2'], ['EffectPointsPerComboPoint3', 'EffectPointsPerComboPoint_3'],
+  ['EffectSpellClassMaskA1', 'EffectSpellClassMaskA_1'], ['EffectSpellClassMaskA2', 'EffectSpellClassMaskA_2'], ['EffectSpellClassMaskA3', 'EffectSpellClassMaskA_3'],
+  ['EffectSpellClassMaskB1', 'EffectSpellClassMaskB_1'], ['EffectSpellClassMaskB2', 'EffectSpellClassMaskB_2'], ['EffectSpellClassMaskB3', 'EffectSpellClassMaskB_3'],
+  ['EffectSpellClassMaskC1', 'EffectSpellClassMaskC_1'], ['EffectSpellClassMaskC2', 'EffectSpellClassMaskC_2'], ['EffectSpellClassMaskC3', 'EffectSpellClassMaskC_3'],
+  ['SpellVisual1', 'SpellVisual_1'], ['SpellVisual2', 'SpellVisual_2'],
+  ['SpellIconID', 'SpellIconID'], ['ActiveIconID', 'ActiveIconID'], ['SpellPriority', 'SpellPriority'],
+  ['SpellName0', 'SpellName'],
+  ['SpellName1', null], ['SpellName2', null], ['SpellName3', null], ['SpellName4', null],
+  ['SpellName5', null], ['SpellName6', null], ['SpellName7', null], ['SpellName8', null],
+  ['SpellNameFlag0', null], ['SpellNameFlag1', null], ['SpellNameFlag2', null], ['SpellNameFlag3', null],
+  ['SpellNameFlag4', null], ['SpellNameFlag5', null], ['SpellNameFlag6', null], ['SpellNameFlag7', null],
+  ['SpellRank0', 'Rank'],
+  ['SpellRank1', null], ['SpellRank2', null], ['SpellRank3', null], ['SpellRank4', null],
+  ['SpellRank5', null], ['SpellRank6', null], ['SpellRank7', null], ['SpellRank8', null],
+  ['SpellRankFlags0', null], ['SpellRankFlags1', null], ['SpellRankFlags2', null], ['SpellRankFlags3', null],
+  ['SpellRankFlags4', null], ['SpellRankFlags5', null], ['SpellRankFlags6', null], ['SpellRankFlags7', null],
+  ['SpellDescription0', 'Description'],
+  ['SpellDescription1', null], ['SpellDescription2', null], ['SpellDescription3', null], ['SpellDescription4', null],
+  ['SpellDescription5', null], ['SpellDescription6', null], ['SpellDescription7', null], ['SpellDescription8', null],
+  ['SpellDescriptionFlags0', null], ['SpellDescriptionFlags1', null], ['SpellDescriptionFlags2', null], ['SpellDescriptionFlags3', null],
+  ['SpellDescriptionFlags4', null], ['SpellDescriptionFlags5', null], ['SpellDescriptionFlags6', null], ['SpellDescriptionFlags7', null],
+  ['SpellToolTip0', 'ToolTip'],
+  ['SpellToolTip1', null], ['SpellToolTip2', null], ['SpellToolTip3', null], ['SpellToolTip4', null],
+  ['SpellToolTip5', null], ['SpellToolTip6', null], ['SpellToolTip7', null], ['SpellToolTip8', null],
+  ['SpellToolTipFlags0', null], ['SpellToolTipFlags1', null], ['SpellToolTipFlags2', null], ['SpellToolTipFlags3', null],
+  ['SpellToolTipFlags4', null], ['SpellToolTipFlags5', null], ['SpellToolTipFlags6', null], ['SpellToolTipFlags7', null],
+  ['ManaCostPercentage', 'ManaCostPercentage'], ['StartRecoveryCategory', 'StartRecoveryCategory'], ['StartRecoveryTime', 'StartRecoveryTime'],
+  ['MaximumTargetLevel', 'MaxTargetLevel'], ['SpellFamilyName', 'SpellFamilyName'],
+  ['SpellFamilyFlags', 'SpellFamilyFlags_1'], ['SpellFamilyFlags1', 'SpellFamilyFlags_2'], ['SpellFamilyFlags2', 'SpellFamilyFlags_3'],
+  ['MaximumAffectedTargets', 'MaxAffectedTargets'], ['DamageClass', 'DmgClass'], ['PreventionType', 'PreventionType'],
+  ['StanceBarOrder', 'StanceBarOrder'],
+  ['EffectDamageMultiplier1', 'DmgMultiplier_1'], ['EffectDamageMultiplier2', 'DmgMultiplier_2'], ['EffectDamageMultiplier3', 'DmgMultiplier_3'],
+  ['MinimumFactionId', 'MinFactionID'], ['MinimumReputation', 'MinReputation'], ['RequiredAuraVision', 'RequiredAuraVision'],
+  ['TotemCategory1', 'TotemCategory_1'], ['TotemCategory2', 'TotemCategory_2'],
+  ['AreaGroupID', 'AreaGroupID'], ['SchoolMask', 'SchoolMask'], ['RuneCostID', 'RuneCostID'],
+  ['SpellMissileID', 'SpellMissileID'], ['PowerDisplayId', 'PowerDisplayID'],
+  ['EffectBonusMultiplier1', 'EffectBonusMultiplier_1'], ['EffectBonusMultiplier2', 'EffectBonusMultiplier_2'], ['EffectBonusMultiplier3', 'EffectBonusMultiplier_3'],
+  ['SpellDescriptionVariableID', 'SpellDescriptionVariableID'], ['SpellDifficultyID', 'SpellDifficultyID'],
+];
+
+// Build a full patchSpellDbcFromSql()-compatible fields patch from an
+// entire sdbeditor.spell row (e.g. a freshly INSERTed "create from
+// template" copy), so a brand-new binary record can be populated with
+// EVERY field the template had, not just the couple of fields the create
+// form explicitly submitted. Uses SPELL_SQL_COLUMN_TO_DBC_FIELD_MAP (the
+// authoritative SQL-column -> real-DBC-field-name table) rather than
+// guessing via name normalization - several fields (DispelType, MaxLevel,
+// SpellVisual_1/2, SpellFamilyFlags_1/2/3, PowerDisplayID, etc.) have SQL
+// column names that do NOT normalize the same as their real DBC field.
+function buildFullSpellFieldsPatchFromRow(sqlRow) {
+  const patch = {};
+  for (const [sqlColumn, dbcField] of SPELL_SQL_COLUMN_TO_DBC_FIELD_MAP) {
+    if (sqlColumn === 'ID' || dbcField === null) continue;
+    const value = sqlRow ? sqlRow[sqlColumn] : undefined;
+    if (value === null || value === undefined) continue;
+    patch[dbcField] = value;
+  }
+
+  // Every real Spell.dbc row needs this locale-availability mask per
+  // locString group, or the client won't display the enUS text slot at
+  // all (see the sync-custom-dbc-to-sql skill's locstring flags note).
+  patch.SpellNameFlags = 16712190;
+  patch.RankFlags = 16712190;
+  patch.DescriptionFlags = 16712190;
+  patch.ToolTipFlags = 16712190;
+
+  return patch;
 }
 
 function buildSpellIconIndex(config) {
@@ -3990,6 +4183,37 @@ app.put('/api/spells/:spellId/edit', async (req, res) => {
   }
 });
 
+// Repair utility: for a spell that already exists correctly in the
+// sdbeditor.spell SQL mirror but has no binary Spell.dbc record at all
+// (e.g. custom spells created before appendBlankSpellDbcRecord existed) -
+// appends a blank record and fully patches it from the existing SQL row.
+// No-op (appended:false, reason:'already-exists') if a binary record for
+// this ID is already present, so it's safe to call repeatedly.
+app.post('/api/spells/:id/repair-dbc-record', async (req, res) => {
+  try {
+    const spellId = Number(req.params.id);
+    if (!Number.isFinite(spellId) || spellId <= 0) {
+      return res.status(400).json({ error: 'Invalid spell ID' });
+    }
+
+    const row = await getCustomSpellRow(spellId);
+    if (!row) {
+      return res.status(404).json({ error: `Spell ${spellId} not found in sdbeditor.spell` });
+    }
+
+    const dbcAppend = appendBlankSpellDbcRecord(spellId);
+    const fullPatch = buildFullSpellFieldsPatchFromRow(row);
+    const dbcPatch = patchSpellDbcFromSql(spellId, fullPatch);
+    const details = await buildSqlOnlySpellDetails(spellId);
+
+    return res.json({ success: true, spellId, dbcAppend, dbcPatch, details });
+  } catch (error) {
+    console.error('Error repairing spell DBC record:', error);
+    logErrorToFile(`Error repairing spell DBC record: ${error.stack || error}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/spells/create-from-template', async (req, res) => {
   try {
     const templateSpellId = Number(req.body?.templateSpellId);
@@ -4021,8 +4245,9 @@ app.post('/api/spells/create-from-template', async (req, res) => {
       return res.status(409).json({ error: `Spell ID ${newSpellId} already exists` });
     }
 
+    let newRow;
     const insertResult = await withCustomSpellConnection(async (conn) => {
-      const newRow = { ...templateRow, ID: Math.trunc(newSpellId) };
+      newRow = { ...templateRow, ID: Math.trunc(newSpellId) };
       const columns = Object.keys(newRow);
       const placeholders = columns.map(() => '?').join(', ');
       const values = columns.map((c) => newRow[c]);
@@ -4036,14 +4261,22 @@ app.post('/api/spells/create-from-template', async (req, res) => {
     const mirrorResult = await mirrorSpellToCustomTable(newSpellId, normalizeSpellPatchFields(fields || {}))
       .catch(() => ({ mirrored: false, reason: 'mirror-failed' }));
 
-    // Best-effort only: a brand-new spell ID has no existing Spell.dbc
-    // record to patch fields into (that would require appending a whole new
-    // record, a separate/riskier operation not attempted here) - so this
-    // will correctly report 'spell-not-in-dbc' for genuinely new IDs rather
-    // than silently claiming success.
+    // A brand-new spell ID has no existing Spell.dbc record at all - the
+    // client can't show an icon and the worldserver can't load spell info
+    // for an ID that isn't in the binary file, no matter how correct the
+    // SQL mirror looks. Append a blank record for it first, then populate
+    // EVERY field from the full copied row (overridden by whatever extra
+    // fields were explicitly submitted), reusing the same tested
+    // patchSpellDbcFromSql field-writing logic used for normal edits.
+    let dbcAppend;
     let dbcPatch;
     try {
-      dbcPatch = patchSpellDbcFromSql(newSpellId, normalizeSpellPatchFields(fields || {}));
+      dbcAppend = appendBlankSpellDbcRecord(newSpellId);
+      const fullPatch = {
+        ...buildFullSpellFieldsPatchFromRow(newRow),
+        ...normalizeSpellPatchFields(fields || {}),
+      };
+      dbcPatch = patchSpellDbcFromSql(newSpellId, fullPatch);
     } catch (err) {
       dbcPatch = { patched: false, reason: `patch-threw: ${err.message}` };
     }
@@ -4057,9 +4290,11 @@ app.post('/api/spells/create-from-template', async (req, res) => {
       updatedFields: mirrorResult?.columns || [],
       skipped: [],
       mirror: { created: insertResult, patch: mirrorResult },
+      dbcAppend,
       dbcPatch,
       details,
     });
+
   } catch (error) {
     console.error('Error creating spell from template:', error);
     logErrorToFile(`Error creating spell from template: ${error.stack || error}`);
