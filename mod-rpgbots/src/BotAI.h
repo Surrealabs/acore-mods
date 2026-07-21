@@ -23,6 +23,19 @@ struct BotInfo
     // Spell queue: when casting/channeling, the next spell to cast is queued
     uint32        queuedSpellId  = 0;
     ObjectGuid    queuedTargetGuid;
+
+    // Current arrow-formation slot (distance/angle behind master). Tracked so
+    // ArrangeArrowFormation only (re)issues MoveFollow when the slot actually
+    // changes instead of restarting the movement generator every tick.
+    // Placed after the existing fields (with their own defaults) so the
+    // positional aggregate-init call in ArmyOfAlts.cpp keeps working.
+    float         followDist  = -1.0f;
+    float         followAngle = 0.0f;
+
+    // Resume position in SpecRotation::sequenceSteps for the optional
+    // rotation_sequence override (see RotationEngine.h). Unused when no
+    // sequence is configured for the bot's spec.
+    uint8         sequenceIndex = 0;
 };
 
 // ─── Bot Manager Singleton ─────────────────────────────────────────────────────

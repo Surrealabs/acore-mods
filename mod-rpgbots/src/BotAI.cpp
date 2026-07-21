@@ -18,8 +18,10 @@
 #include "RotationEngine.h"
 #include "ScriptMgr.h"
 #include "Player.h"
+#include "Creature.h"
 #include "ObjectAccessor.h"
 #include "MotionMaster.h"
+#include "Map.h"
 #include "Group.h"
 #include "Log.h"
 #include "Chat.h"
@@ -33,7 +35,14 @@
 #include <algorithm>
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
-static constexpr uint32 AI_UPDATE_INTERVAL_MS = 1000;
+// Kept well below the real global cooldown (1.5s) so a bot casts on the
+// very next tick after its GCD actually clears, instead of waiting for an
+// extra ~1s polling slot. At 1000ms, a bot whose GCD ends at t=1.5s only
+// gets checked again at t=2.0s, i.e. its true cast cadence was ~2s, not the
+// ~1s the rest of the cooldown/category math assumes - this is what made a
+// 4-second shared category cooldown look more like ~6-8s in practice ("2
+// flip-flopping abilities" bug report).
+static constexpr uint32 AI_UPDATE_INTERVAL_MS = 250;
 static constexpr float  MAX_FOLLOW_DISTANCE   = 40.0f;
 static constexpr float  COMBAT_CHASE_MELEE    = 0.5f;
 static constexpr float  COMBAT_CHASE_RANGED   = 25.0f;
@@ -43,6 +52,11 @@ static constexpr float  MELEE_HEALER_HEAL_THRESHOLD_PCT  = 80.0f;
 static constexpr float  MELEE_HEALER_MIN_MANA_PCT        = 20.0f;
 static constexpr float  DEFENSIVE_HP_PCT      = 35.0f;
 static constexpr uint32 HUNTER_AUTO_SHOT      = 75;
+
+// Bots have no mount and would otherwise creep further and further behind
+// the master on every step; pets get an implicit speed match, so give bots
+// the same treatment with a flat +45% run/walk/swim speed bonus.
+static constexpr float  BOT_SPEED_RATE        = 1.45f;
 
 // Warlock spell IDs
 static constexpr uint32 WARLOCK_SOULBURN      = 17877;  // Shadowburn (Destro talent, costs shard)
@@ -87,7 +101,8 @@ static bool IsMeleeRole(BotRole role)
 {
     return role == BotRole::ROLE_MELEE_DPS ||
            role == BotRole::ROLE_TANK ||
-           role == BotRole::ROLE_MELEE_HEALER;
+           role == BotRole::ROLE_MELEE_HEALER ||
+           role == BotRole::ROLE_MELEE_DOT;
 }
 
 static float GetManaPct(Player* bot)
@@ -121,6 +136,17 @@ static float Dist2D(Unit* a, Unit* b)
     return std::sqrt(dx * dx + dy * dy);
 }
 
+// Keep the bot's movement speed matched to the master (like a pet) so it
+// never gradually falls behind on foot. Cheap to call every tick: Unit::SetSpeed
+// no-ops when the rate hasn't changed.
+static void ApplyBotSpeedBonus(Player* bot)
+{
+    if (!bot) return;
+    bot->SetSpeed(MOVE_RUN,  BOT_SPEED_RATE);
+    bot->SetSpeed(MOVE_WALK, BOT_SPEED_RATE);
+    bot->SetSpeed(MOVE_SWIM, BOT_SPEED_RATE);
+}
+
 static void TeleportToMaster(Player* bot, Player* master)
 {
     float ang = frand(0.f, 2.f * float(M_PI));
@@ -128,10 +154,43 @@ static void TeleportToMaster(Player* bot, Player* master)
     float x = master->GetPositionX() + d * std::cos(ang);
     float y = master->GetPositionY() + d * std::sin(ang);
     float z = master->GetPositionZ();
-    if (bot->GetMapId() != master->GetMapId())
-        bot->TeleportTo(master->GetMapId(), x, y, z, master->GetOrientation());
-    else
-        bot->NearTeleportTo(x, y, z, master->GetOrientation());
+    float o = master->GetOrientation();
+
+    if (bot->GetMapId() == master->GetMapId())
+    {
+        bot->NearTeleportTo(x, y, z, o);
+        return;
+    }
+
+    // Cross-map (e.g. the master used a Mage portal/teleport spell): a normal
+    // Player::TeleportTo() defers the actual map switch until the client
+    // sends back MSG_MOVE_WORLDPORT_ACK. Bots are socketless and can never
+    // send that ack, so the bot would just be removed from the old map and
+    // never placed on the new one — it vanishes instead of catching up.
+    // Move it manually instead, the same way ArmyOfAlts places a
+    // freshly-spawned bot onto the master's map.
+    Map* destMap = master->GetMap();
+    if (!destMap)
+        return;
+
+    if (bot->IsInWorld())
+        bot->RemoveFromWorld();
+    if (Map* oldMap = bot->FindMap())
+        oldMap->RemovePlayerFromMap(bot, false);
+
+    bot->Relocate(x, y, z, o);
+    bot->SetMapId(master->GetMapId());
+    bot->ResetMap();
+    bot->SetMap(destMap);
+    bot->UpdatePositionData();
+
+    bot->SendInitialPacketsBeforeAddToMap();
+    if (!destMap->AddPlayerToMap(bot))
+    {
+        LOG_ERROR("module", "RPGBots: Failed to relocate bot {} to master's map", bot->GetName());
+        return;
+    }
+    bot->SendInitialPacketsAfterAddToMap();
 }
 
 // Find party member with lowest HP% (same map, alive)
@@ -153,15 +212,83 @@ static Player* FindLowestHP(Player* bot, Player* master)
     return lowest;
 }
 
+// ─── Category-cooldown check ──────────────────────────────────────────────────
+// Player::GetSpellCooldownMap() is NOT reliable for this: core's own
+// Player::AddSpellAndCategoryCooldowns() stamps the CAST spell's own map
+// entry with category=0 (hardcoded), and only back-fills a proper
+// `category` field on OTHER spells in `sSpellsByCategoryStore` that share
+// the exact same SpellFamilyName as the cast spell. Custom/cross-family
+// rotational spells (the norm for these mod-*-expanded modules) never get
+// that sibling entry populated, so scanning the core cooldown map for a
+// matching `category` silently found nothing and every "locked out" spell
+// kept getting cast anyway. Track category lockouts ourselves instead,
+// independent of core's family-gated bookkeeping: TryCast() below records
+// an expiry per (bot, category) on every successful cast; this just reads
+// it back.
+static std::unordered_map<ObjectGuid, std::unordered_map<uint32, uint32>> g_categoryCooldowns;
+
+static bool HasCategoryCooldown(Player* bot, uint32 spellId)
+{
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+    if (!info || info->GetCategory() == 0)
+        return false;
+
+    auto botIt = g_categoryCooldowns.find(bot->GetGUID());
+    if (botIt == g_categoryCooldowns.end())
+        return false;
+
+    auto catIt = botIt->second.find(info->GetCategory());
+    if (catIt == botIt->second.end())
+        return false;
+
+    return catIt->second > getMSTime();
+}
+
+// Records the category-cooldown expiry for a spell that was just cast, so
+// later HasCategoryCooldown() checks correctly lock out every OTHER spell
+// sharing that category, regardless of SpellFamilyName.
+static void RecordCategoryCooldown(Player* bot, SpellInfo const* info)
+{
+    if (!info || info->GetCategory() == 0 || info->CategoryRecoveryTime == 0)
+        return;
+
+    g_categoryCooldowns[bot->GetGUID()][info->GetCategory()] = getMSTime() + info->CategoryRecoveryTime;
+}
+
 // ─── Spell eligibility check (no cast — dry run) ──────────────────────────────
 // Returns true if the spell COULD be cast right now (has spell, not on CD, etc.)
+
+// TEMPORARY diagnostic: logs exactly why 900064/900065/900066 (the
+// Elementalist's 3 shared-category nukes) fail CanCast/CastSpell, since the
+// bot keeps skipping them no matter how rotation_sequence is tuned. Remove
+// once root-caused.
+static bool IsDiagSpell(uint32 spellId)
+{
+    return spellId == 900064 || spellId == 900065 || spellId == 900066;
+}
 
 static bool CanCast(Player* bot, Unit* target, uint32 spellId)
 {
     if (spellId == 0)          return false;
     if (!target)               return false;
-    if (!bot->HasSpell(spellId))       return false;
-    if (bot->HasSpellCooldown(spellId)) return false;
+    if (!bot->HasSpell(spellId))
+    {
+        if (IsDiagSpell(spellId))
+            LOG_ERROR("module", "RPGBOTS-DIAG bot {} CanCast({}) fail: bot doesn't know the spell", bot->GetName(), spellId);
+        return false;
+    }
+    if (bot->HasSpellCooldown(spellId))
+    {
+        if (IsDiagSpell(spellId))
+            LOG_ERROR("module", "RPGBOTS-DIAG bot {} CanCast({}) fail: HasSpellCooldown", bot->GetName(), spellId);
+        return false;
+    }
+    if (HasCategoryCooldown(bot, spellId))
+    {
+        if (IsDiagSpell(spellId))
+            LOG_ERROR("module", "RPGBOTS-DIAG bot {} CanCast({}) fail: HasCategoryCooldown", bot->GetName(), spellId);
+        return false;
+    }
 
     // Warlock Soulburn (Shadowburn): require soul shard (spec can be custom)
     if (spellId == WARLOCK_SOULBURN)
@@ -187,7 +314,21 @@ static bool TryCast(Player* bot, Unit* target, uint32 spellId)
     if (!CanCast(bot, target, spellId))
         return false;
 
-    return bot->CastSpell(target, spellId, false) == SPELL_CAST_OK;
+    SpellCastResult result = bot->CastSpell(target, spellId, false);
+    if (result != SPELL_CAST_OK)
+    {
+        if (IsDiagSpell(spellId))
+            LOG_ERROR("module", "RPGBOTS-DIAG bot {} CastSpell({}) on target {} failed: result={}",
+                      bot->GetName(), spellId, target ? target->GetName() : "null", uint32(result));
+        return false;
+    }
+
+    if (IsDiagSpell(spellId))
+        LOG_ERROR("module", "RPGBOTS-DIAG bot {} CastSpell({}) on target {} SUCCEEDED",
+                  bot->GetName(), spellId, target ? target->GetName() : "null");
+
+    RecordCategoryCooldown(bot, sSpellMgr->GetSpellInfo(spellId));
+    return true;
 }
 
 static void EnsureRangedFacing(Player* bot, Unit* enemy, BotRole role)
@@ -241,30 +382,8 @@ static bool IsWarlockMetamorphosisActive(Player* bot)
 }
 
 // Buffs: cast on SELF if the aura is missing — ONLY during combat
-static bool RunBuffs(Player* bot, const std::array<uint32, SPELLS_PER_BUCKET>& spells)
-{
-    for (uint32 id : spells)
-    {
-        if (id == 0) continue;
-        if (bot->HasAura(id))  continue;                 // already have it
-
-        // Warlock Metamorphosis: only pop Meta when mana >= 81%
-        if (id == WARLOCK_METAMORPHOSIS)
-        {
-            if (IsWarlockMetamorphosisActive(bot))
-                continue;
-
-            if (bot->GetPower(POWER_MANA) * 100 / std::max(bot->GetMaxPower(POWER_MANA), 1u) < META_MANA_THRESHOLD)
-                continue;
-        }
-
-        if (TryCast(bot, bot, id)) return true;
-    }
-    return false;
-}
-
 // Defensives: cast on SELF only when HP < threshold
-static bool RunDefensives(Player* bot, const std::array<uint32, SPELLS_PER_BUCKET>& spells)
+static bool RunDefensives(Player* bot, const std::array<uint32, DEFENSIVE_SLOTS>& spells)
 {
     if (bot->GetHealthPct() >= DEFENSIVE_HP_PCT)
         return false; // not in danger, skip entire bucket
@@ -277,133 +396,249 @@ static bool RunDefensives(Player* bot, const std::array<uint32, SPELLS_PER_BUCKE
     return false;
 }
 
-// Abilities: target depends on role
-//   healer  → lowest-HP party member below HEAL_THRESHOLD_PCT
-//   others  → enemy (master's target)
-static bool RunAbilities(Player* bot, Player* master, Unit* enemy,
-                         BotRole role,
-                         const std::array<uint32, SPELLS_PER_BUCKET>& spells)
+// Mage Pyroblast (all ranks) should only be hard-cast when BOTH Hot Streak
+// (48108, mod-mage-expanded) AND Combustion (11129) are up — otherwise
+// it's a slow, expensive cast bots have no business spamming; skip it and
+// fall through to the next ability in the list (e.g. Fireball) until both
+// conditions are met.
+static constexpr uint32 MAGE_PYROBLAST_BASE   = 11366;
+static constexpr uint32 MAGE_HOT_STREAK_BUFF  = 48108;
+static constexpr uint32 MAGE_COMBUSTION_BUFF  = 11129;
+
+static bool ShouldSkipAbility(Player* bot, uint32 id)
 {
-    if (role == BotRole::ROLE_MELEE_HEALER)
-    {
-        (void)master;
-
-        if (!enemy) return false;
-        for (uint32 id : spells)
-        {
-            if (id == 0) continue;
-            if (TryCast(bot, enemy, id)) return true;
-        }
+    if (!bot || bot->getClass() != CLASS_MAGE)
         return false;
+
+    if (sSpellMgr->GetFirstSpellInChain(id) != MAGE_PYROBLAST_BASE)
+        return false;
+
+    return !bot->HasAura(MAGE_HOT_STREAK_BUFF) || !bot->HasAura(MAGE_COMBUSTION_BUFF);
+}
+
+// Filler: a single instant "weave" spell that can be cast WITHOUT
+// interrupting the bot's current cast (e.g. Fire Blast while casting
+// Fireball). Checked every tick regardless of casting state, and again as
+// the final fallback if nothing else in the waterfall fired — see
+// RunWaterfall below.
+static bool RunFiller(Player* bot, Unit* enemy, uint32 spellId)
+{
+    if (spellId == 0 || !enemy)
+        return false;
+
+    return TryCast(bot, enemy, spellId);
+}
+
+// Interrupt: only ever cast on the enemy WHILE it's actively casting a
+// generic or channeled spell. Deliberately does not attempt to reason
+// about which spells are actually interruptible (uninterruptible casts,
+// silence immunity, etc.) - SPELL_EFFECT_INTERRUPT_CAST already no-ops
+// safely server-side if the target can't be interrupted, so this stays
+// simple and just avoids wasting the attempt entirely idle.
+static bool RunInterrupt(Player* bot, Unit* enemy, uint32 spellId)
+{
+    if (spellId == 0 || !enemy)
+        return false;
+
+    bool isCasting = enemy->GetCurrentSpell(CURRENT_GENERIC_SPELL) != nullptr ||
+                     enemy->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr;
+    if (!isCasting)
+        return false;
+
+    return TryCast(bot, enemy, spellId);
+}
+
+// Damage cooldown / party buff: both are self-cast, timed cast-then-active
+// cooldowns (Recklessness/Combustion-style, or Heroism/Power Infusion-style)
+// - not passive stat auras (those need no bot involvement at all) - so both
+// just fire as soon as they're off cooldown while the bot is fighting.
+static bool RunDamageCooldown(Player* bot, Unit* enemy, uint32 spellId)
+{
+    if (spellId == 0 || !enemy)
+        return false;
+    return TryCast(bot, bot, spellId);
+}
+
+static bool RunPartyBuff(Player* bot, Unit* enemy, uint32 spellId)
+{
+    if (spellId == 0 || !enemy)
+        return false;
+    return TryCast(bot, bot, spellId);
+}
+
+// ─── Tank/DPS slot targeting rule ──────────────────────────────────────────────
+// Self-buffs (WARLOCK_METAMORPHOSIS special-cased, otherwise plain
+// SpellInfo::IsPositive() spells) auto-target self and skip once already
+// up; everything else targets the enemy. `doCast(target, id)` performs the
+// actual action (a real TryCast for RunRotation, a CanCast dry-run + queue
+// write for ScanWaterfall) and reports whether the slot was used, so this
+// same eligibility/targeting logic can drive both the real cast path and
+// the dry-run scan path without duplicating it.
+template <typename CastFn>
+static bool TryTankDpsSlot(Player* bot, Unit* enemy, uint32 id, CastFn&& doCast)
+{
+    if (id == 0 || ShouldSkipAbility(bot, id))
+        return false;
+
+    bool isSelfTargeted = (id == WARLOCK_METAMORPHOSIS);
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(id);
+    if (info && info->IsPositive())
+        isSelfTargeted = true;
+
+    // Caster-centered AoE effects (e.g. a nova/explosion that damages
+    // everyone around the caster, like 900065 "Pneumatic Rupture") are
+    // still NEGATIVE (IsPositive() correctly false - they deal damage), but
+    // their primary effect's implicit target is the caster, not an
+    // explicit enemy Unit. Passing `enemy` as the explicit CastSpell target
+    // for one of these gets rejected (bad target) every time since the
+    // spell never asked for an explicit unit target at all - route these
+    // to self exactly like a self-buff instead.
+    if (info && !isSelfTargeted)
+    {
+        Targets primaryTarget = info->Effects[EFFECT_0].TargetA.GetTarget();
+        if (primaryTarget == TARGET_UNIT_CASTER || primaryTarget == TARGET_DEST_CASTER)
+            isSelfTargeted = true;
     }
 
-    if (role == BotRole::ROLE_RANGED_HEALER)
+    if (IsDiagSpell(id))
+        LOG_ERROR("module", "RPGBOTS-DIAG bot {} slot {} known={} isSelfTargeted={} isPositive={} enemy={}",
+                  bot->GetName(), id, bot->HasSpell(id), isSelfTargeted, info && info->IsPositive(), enemy ? enemy->GetName() : "null");
+
+    if (isSelfTargeted)
     {
-        Player* healTarget = FindLowestHP(bot, master);
-        if (healTarget && healTarget->GetHealthPct() <= RANGED_HEALER_HEAL_THRESHOLD_PCT)
+        if (id == WARLOCK_METAMORPHOSIS)
         {
-            for (uint32 id : spells)
-            {
-                if (id == 0) continue;
-                if (TryCast(bot, healTarget, id)) return true;
-            }
+            if (IsWarlockMetamorphosisActive(bot)) return false;
+            if (bot->GetPower(POWER_MANA) * 100 / std::max(bot->GetMaxPower(POWER_MANA), 1u) < META_MANA_THRESHOLD)
+                return false;
+        }
+        else if (bot->HasAura(id))
             return false;
-        }
 
-        if (!enemy) return false;
-        for (uint32 id : spells)
+        return doCast(bot, id);
+    }
+
+    if (!enemy) return false;
+    return doCast(enemy, id);
+}
+
+// Selects which tank/dps ability to use this tick via `doCast`. If the spec
+// has a `rotation_sequence` configured (rot->sequenceSteps non-empty), ONLY
+// the current step (info.sequenceIndex) is attempted - no scanning ahead to
+// other steps. If that step isn't castable right now, this simply returns
+// false and lets RunWaterfall's normal Filler fallback (5b) pick up the
+// slack that tick; the cursor does NOT advance, so the same step is retried
+// next tick until it's actually available. This is deliberately "dumb":
+// scanning ahead (trying every step in the sequence for a same-tick match)
+// let cheap/always-up steps (e.g. a real Frost Shock) repeatedly jump the
+// queue ahead of a same-category nuke waiting its turn, which defeated the
+// whole point of an explicit sequence - see the bug report where 900065
+// never got a turn despite being in the string, because 900064/900066/
+// filler kept "winning" the scan every tick instead of the sequence just
+// stalling on 900065 and falling back to filler like it should have.
+// Falls back to a plain top-to-bottom scan of `rot->rotation` when no
+// sequence is configured (unchanged legacy behavior for every other spec).
+template <typename CastFn>
+static bool RunTankDpsSlots(const SpecRotation* rot, BotInfo& info, CastFn&& doCast)
+{
+    if (!rot->sequenceSteps.empty())
+    {
+        uint8 count = uint8(rot->sequenceSteps.size());
+        uint8 idx   = info.sequenceIndex % count;
+        uint8 step  = rot->sequenceSteps[idx];
+        uint32 id   = (step == SEQUENCE_FILLER_STEP) ? rot->filler : rot->rotation[step];
+
+        if (doCast(id))
         {
-            if (id == 0) continue;
-            if (TryCast(bot, enemy, id)) return true;
+            info.sequenceIndex = uint8((idx + 1) % count);
+            return true;
         }
         return false;
     }
 
-    if (role == BotRole::ROLE_HEALER)
+    for (uint32 id : rot->rotation)
+        if (doCast(id))
+            return true;
+    return false;
+}
+
+// Rotation: the 5 real rotational abilities. Role decides how they behave:
+//   healer roles (HEALER/RANGED_HEALER/MELEE_HEALER) — target the lowest-HP
+//     ally (once below that role's own heal threshold); skip a slot if the
+//     ally already has that aura (harmless no-op for plain instant heals,
+//     correctly avoids re-stacking/overwriting HoTs).
+//   dot roles (RANGED_DOT/MELEE_DOT) — target the enemy; skip a slot if the
+//     enemy already has that aura (DoT refresh semantics).
+//   tank/dps roles — priority list on the enemy (top-to-bottom, or the
+//     spec's rotation_sequence order if configured — see RunTankDpsSlots),
+//     EXCEPT any slot that's actually a self-buff (SpellInfo::IsPositive())
+//     auto-targets self instead and is skipped once already up - this is
+//     how self-buffs (e.g. Warlock Metamorphosis) fold into the same 5
+//     slots instead of needing a dedicated bucket.
+static bool RunRotation(Player* bot, Player* master, Unit* enemy,
+                        const SpecRotation* rot, BotInfo& info)
+{
+    BotRole role = rot->role;
+    const std::array<uint32, ROTATION_SLOTS>& spells = rot->rotation;
+
+    if (role == BotRole::ROLE_HEALER || role == BotRole::ROLE_RANGED_HEALER || role == BotRole::ROLE_MELEE_HEALER)
     {
         Player* healTarget = FindLowestHP(bot, master);
-        if (!healTarget || healTarget->GetHealthPct() >= HEAL_THRESHOLD_PCT)
+        if (!healTarget)
+            return false;
+
+        float threshold = HEAL_THRESHOLD_PCT;
+        if (role == BotRole::ROLE_RANGED_HEALER) threshold = RANGED_HEALER_HEAL_THRESHOLD_PCT;
+        if (role == BotRole::ROLE_MELEE_HEALER)  threshold = MELEE_HEALER_HEAL_THRESHOLD_PCT;
+
+        if (healTarget->GetHealthPct() >= threshold)
             return false; // nobody needs healing
 
+        if (role == BotRole::ROLE_MELEE_HEALER && GetManaPct(bot) < MELEE_HEALER_MIN_MANA_PCT)
+            return false;
+
         for (uint32 id : spells)
         {
             if (id == 0) continue;
+            if (ShouldSkipAbility(bot, id)) continue;
+            if (healTarget->HasAura(id)) continue; // already ticking/applied
             if (TryCast(bot, healTarget, id)) return true;
         }
         return false;
     }
 
-    // DPS / Tank: cast on enemy
-    if (!enemy) return false;
-    for (uint32 id : spells)
+    if (role == BotRole::ROLE_RANGED_DOT || role == BotRole::ROLE_MELEE_DOT)
     {
-        if (id == 0) continue;
-        if (TryCast(bot, enemy, id)) return true;
-    }
-    return false;
-}
-
-// DoTs: cast on ENEMY if the aura is missing on the target
-static bool RunDots(Player* bot, Unit* enemy,
-                    const std::array<uint32, SPELLS_PER_BUCKET>& spells)
-{
-    if (!enemy) return false;
-    for (uint32 id : spells)
-    {
-        if (id == 0) continue;
-        if (enemy->HasAura(id))  continue;               // already ticking
-        if (TryCast(bot, enemy, id)) return true;
-    }
-    return false;
-}
-
-// HoTs: cast on lowest-HP ally if the aura is missing
-static bool RunHots(Player* bot, Player* master,
-                    BotRole role,
-                    const std::array<uint32, SPELLS_PER_BUCKET>& spells)
-{
-    Player* target = FindLowestHP(bot, master);
-    if (!target) return false;
-
-    if (role == BotRole::ROLE_MELEE_HEALER)
-    {
-        bool needHeal = target->GetHealthPct() <= MELEE_HEALER_HEAL_THRESHOLD_PCT;
-        bool hasHealMana = GetManaPct(bot) >= MELEE_HEALER_MIN_MANA_PCT;
-        if (!needHeal || !hasHealMana)
-            return false;
-
+        if (!enemy) return false;
         for (uint32 id : spells)
         {
             if (id == 0) continue;
-            if (TryCast(bot, target, id)) return true;
+            if (enemy->HasAura(id)) continue; // already ticking
+            if (TryCast(bot, enemy, id)) return true;
         }
         return false;
     }
 
-    for (uint32 id : spells)
+    // Tank / melee DPS / ranged DPS.
+    return RunTankDpsSlots(rot, info, [bot, enemy](uint32 id)
     {
-        if (id == 0) continue;
-        if (target->HasAura(id))  continue;              // already ticking
-        if (TryCast(bot, target, id)) return true;
-    }
-    return false;
+        return TryTankDpsSlot(bot, enemy, id, [bot](Unit* target, uint32 spellId)
+        {
+            return TryCast(bot, target, spellId);
+        });
+    });
 }
 
 // Mobility: cast on SELF if we're out of preferred range of the enemy
-static bool RunMobility(Player* bot, Unit* enemy, float preferredRange,
-                        const std::array<uint32, SPELLS_PER_BUCKET>& spells)
+static bool RunMobility(Player* bot, Unit* enemy, float preferredRange, uint32 spellId)
 {
-    if (!enemy) return false;
+    if (spellId == 0 || !enemy)
+        return false;
     // Only trigger if we're significantly farther than preferred range
     float dist = Dist2D(bot, enemy);
     if (dist <= preferredRange + 5.f) return false; // close enough
 
-    for (uint32 id : spells)
-    {
-        if (id == 0) continue;
-        if (TryCast(bot, bot, id)) return true;
-    }
-    return false;
+    return TryCast(bot, bot, spellId);
 }
 
 // ─── Meta: Trinkets + Racials ──────────────────────────────────────────────────
@@ -468,29 +703,22 @@ static bool RunMeta(Player* bot, Unit* enemy)
 
 // ─── Spell Queue Scanner ───────────────────────────────────────────────────────
 // Scans the waterfall WITHOUT casting.  Returns the first eligible (spell, target)
-// pair that would fire if the bot were free to cast right now.
+// pair that would fire if the bot were free to cast right now. Mirrors the
+// exact bucket order in RunWaterfall below.
 
 static bool ScanWaterfall(Player* bot, Player* master, Unit* enemy,
-                          const SpecRotation* rot,
+                          const SpecRotation* rot, BotInfo& info,
                           uint32& outSpellId, ObjectGuid& outTargetGuid)
 {
-    // 1. Buffs
-    for (uint32 id : rot->buffs)
+    // 1. Interrupt
+    if (enemy && rot->interrupt != 0)
     {
-        if (id == 0) continue;
-        if (bot->HasAura(id)) continue;
-        if (id == WARLOCK_METAMORPHOSIS)
+        bool isCasting = enemy->GetCurrentSpell(CURRENT_GENERIC_SPELL) != nullptr ||
+                         enemy->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr;
+        if (isCasting && CanCast(bot, enemy, rot->interrupt))
         {
-            if (IsWarlockMetamorphosisActive(bot))
-                continue;
-
-            if (bot->GetPower(POWER_MANA) * 100 / std::max(bot->GetMaxPower(POWER_MANA), 1u) < META_MANA_THRESHOLD)
-                continue;
-        }
-        if (CanCast(bot, bot, id))
-        {
-            outSpellId = id;
-            outTargetGuid = bot->GetGUID();
+            outSpellId = rot->interrupt;
+            outTargetGuid = enemy->GetGUID();
             return true;
         }
     }
@@ -510,91 +738,60 @@ static bool ScanWaterfall(Player* bot, Player* master, Unit* enemy,
         }
     }
 
-    // 3. DoTs
-    if (enemy)
+    // 3. Damage cooldown
+    if (enemy && CanCast(bot, bot, rot->damageCooldown))
     {
-        for (uint32 id : rot->dots)
-        {
-            if (id == 0) continue;
-            if (enemy->HasAura(id)) continue;
-            if (CanCast(bot, enemy, id))
-            {
-                outSpellId = id;
-                outTargetGuid = enemy->GetGUID();
-                return true;
-            }
-        }
+        outSpellId = rot->damageCooldown;
+        outTargetGuid = bot->GetGUID();
+        return true;
     }
 
-    // 4. HoTs
+    // 4. Party buff
+    if (enemy && CanCast(bot, bot, rot->partyBuff))
     {
-        Player* hotTarget = FindLowestHP(bot, master);
-        if (hotTarget)
-        {
-            for (uint32 id : rot->hots)
-            {
-                if (id == 0) continue;
-                if (rot->role == BotRole::ROLE_MELEE_HEALER)
-                {
-                    bool needHeal = hotTarget->GetHealthPct() <= MELEE_HEALER_HEAL_THRESHOLD_PCT;
-                    bool hasHealMana = GetManaPct(bot) >= MELEE_HEALER_MIN_MANA_PCT;
-                    if (!needHeal || !hasHealMana)
-                        continue;
-                }
-                else if (hotTarget->HasAura(id))
-                    continue;
-
-                if (CanCast(bot, hotTarget, id))
-                {
-                    outSpellId = id;
-                    outTargetGuid = hotTarget->GetGUID();
-                    return true;
-                }
-            }
-        }
+        outSpellId = rot->partyBuff;
+        outTargetGuid = bot->GetGUID();
+        return true;
     }
 
-    // 5. Abilities
-    if (rot->role == BotRole::ROLE_HEALER)
+    // 5. Rotation (role-aware)
+    if (rot->role == BotRole::ROLE_HEALER || rot->role == BotRole::ROLE_RANGED_HEALER || rot->role == BotRole::ROLE_MELEE_HEALER)
     {
         Player* healTarget = FindLowestHP(bot, master);
-        if (healTarget && healTarget->GetHealthPct() < HEAL_THRESHOLD_PCT)
+        if (healTarget)
         {
-            for (uint32 id : rot->abilities)
+            float threshold = HEAL_THRESHOLD_PCT;
+            if (rot->role == BotRole::ROLE_RANGED_HEALER) threshold = RANGED_HEALER_HEAL_THRESHOLD_PCT;
+            if (rot->role == BotRole::ROLE_MELEE_HEALER)  threshold = MELEE_HEALER_HEAL_THRESHOLD_PCT;
+
+            bool needHeal = healTarget->GetHealthPct() < threshold;
+            bool hasHealMana = rot->role != BotRole::ROLE_MELEE_HEALER || GetManaPct(bot) >= MELEE_HEALER_MIN_MANA_PCT;
+
+            if (needHeal && hasHealMana)
             {
-                if (id == 0) continue;
-                if (CanCast(bot, healTarget, id))
+                for (uint32 id : rot->rotation)
                 {
-                    outSpellId = id;
-                    outTargetGuid = healTarget->GetGUID();
-                    return true;
+                    if (id == 0) continue;
+                    if (ShouldSkipAbility(bot, id)) continue;
+                    if (healTarget->HasAura(id)) continue;
+                    if (CanCast(bot, healTarget, id))
+                    {
+                        outSpellId = id;
+                        outTargetGuid = healTarget->GetGUID();
+                        return true;
+                    }
                 }
             }
         }
     }
-    else if (rot->role == BotRole::ROLE_RANGED_HEALER)
+    else if (rot->role == BotRole::ROLE_RANGED_DOT || rot->role == BotRole::ROLE_MELEE_DOT)
     {
-        Player* healTarget = FindLowestHP(bot, master);
-        if (healTarget && healTarget->GetHealthPct() <= RANGED_HEALER_HEAL_THRESHOLD_PCT)
-        {
-            for (uint32 id : rot->abilities)
-            {
-                if (id == 0) continue;
-                if (CanCast(bot, healTarget, id))
-                {
-                    outSpellId = id;
-                    outTargetGuid = healTarget->GetGUID();
-                    return true;
-                }
-            }
-            return false;
-        }
-
         if (enemy)
         {
-            for (uint32 id : rot->abilities)
+            for (uint32 id : rot->rotation)
             {
                 if (id == 0) continue;
+                if (enemy->HasAura(id)) continue;
                 if (CanCast(bot, enemy, id))
                 {
                     outSpellId = id;
@@ -604,52 +801,33 @@ static bool ScanWaterfall(Player* bot, Player* master, Unit* enemy,
             }
         }
     }
-    else if (rot->role == BotRole::ROLE_MELEE_HEALER)
+    else
     {
-        if (enemy)
+        if (RunTankDpsSlots(rot, info, [bot, enemy, &outSpellId, &outTargetGuid](uint32 id)
         {
-            for (uint32 id : rot->abilities)
+            return TryTankDpsSlot(bot, enemy, id, [bot, &outSpellId, &outTargetGuid](Unit* target, uint32 spellId)
             {
-                if (id == 0) continue;
-                if (CanCast(bot, enemy, id))
-                {
-                    outSpellId = id;
-                    outTargetGuid = enemy->GetGUID();
-                    return true;
-                }
-            }
-        }
-    }
-    else if (enemy)
-    {
-        for (uint32 id : rot->abilities)
-        {
-            if (id == 0) continue;
-            if (CanCast(bot, enemy, id))
-            {
-                outSpellId = id;
-                outTargetGuid = enemy->GetGUID();
+                if (!CanCast(bot, target, spellId))
+                    return false;
+                outSpellId = spellId;
+                outTargetGuid = target->GetGUID();
                 return true;
-            }
+            });
+        }))
+        {
+            return true;
         }
     }
 
     // 6. Mobility
-    if (enemy)
+    if (enemy && rot->mobility != 0)
     {
         float dist = Dist2D(bot, enemy);
-        if (dist > rot->preferredRange + 5.f)
+        if (dist > rot->preferredRange + 5.f && CanCast(bot, bot, rot->mobility))
         {
-            for (uint32 id : rot->mobility)
-            {
-                if (id == 0) continue;
-                if (CanCast(bot, bot, id))
-                {
-                    outSpellId = id;
-                    outTargetGuid = bot->GetGUID();
-                    return true;
-                }
-            }
+            outSpellId = rot->mobility;
+            outTargetGuid = bot->GetGUID();
+            return true;
         }
     }
 
@@ -669,15 +847,20 @@ static void RunWaterfall(Player* bot, Player* master, Unit* enemy,
     if (TryMaintainHunterAutoShot(bot, enemy))
         return;
 
-    // ── Currently casting or channeling — queue next spell, don't interrupt ──
+    // ── Currently casting or channeling — try a filler weave, else queue ───
     if (bot->HasUnitState(UNIT_STATE_CASTING))
     {
+        // Instant spells like Fire Blast can be woven in without
+        // interrupting the current cast — try that first every tick.
+        if (RunFiller(bot, enemy, rot->filler))
+            return;
+
         // Only queue if nothing is queued yet — avoid overwriting mid-cast
         if (info.queuedSpellId == 0)
         {
             uint32 qSpell = 0;
             ObjectGuid qTarget;
-            if (ScanWaterfall(bot, master, enemy, rot, qSpell, qTarget))
+            if (ScanWaterfall(bot, master, enemy, rot, info, qSpell, qTarget))
             {
                 info.queuedSpellId    = qSpell;
                 info.queuedTargetGuid = qTarget;
@@ -709,24 +892,28 @@ static void RunWaterfall(Player* bot, Player* master, Unit* enemy,
     if (RunMeta(bot, enemy))
         return;
 
-    // 1. Buffs — "Is my tax paid?"
-    if (RunBuffs(bot, rot->buffs))
+    // 1. Interrupt — "Can I stop that cast?"
+    if (RunInterrupt(bot, enemy, rot->interrupt))
         return;
 
     // 2. Defensives — "Am I dying?"
     if (RunDefensives(bot, rot->defensives))
         return;
 
-    // 3. DoTs — "Are my DoTs ticking?"
-    if (RunDots(bot, enemy, rot->dots))
+    // 3. Damage cooldown — "Is my big offensive CD up?"
+    if (RunDamageCooldown(bot, enemy, rot->damageCooldown))
         return;
 
-    // 4. HoTs — "Are my HoTs rolling?"
-    if (RunHots(bot, master, rot->role, rot->hots))
+    // 4. Party buff — "Is my raid CD up?"
+    if (RunPartyBuff(bot, enemy, rot->partyBuff))
         return;
 
-    // 5. Abilities — "What do I press?"
-    if (RunAbilities(bot, master, enemy, rot->role, rot->abilities))
+    // 5. Rotation — "What do I press?"
+    if (RunRotation(bot, master, enemy, rot, info))
+        return;
+
+    // 5b. Filler — nothing better to do, try a weave spell anyway
+    if (RunFiller(bot, enemy, rot->filler))
         return;
 
     // 6. Mobility — "Can I get in range?"
@@ -747,14 +934,6 @@ static void ArrangeArrowFormation(Player* master, std::vector<BotInfo>& bots)
 {
     if (bots.empty()) return;
 
-    float masterX = master->GetPositionX();
-    float masterY = master->GetPositionY();
-    float masterZ = master->GetPositionZ();
-    float facing  = master->GetOrientation();
-
-    // "Behind" direction = facing + PI
-    float behind = facing + float(M_PI);
-
     // Sort bots into role buckets
     std::vector<BotInfo*> tanks, melee, ranged, healers;
     for (auto& info : bots)
@@ -772,6 +951,8 @@ static void ArrangeArrowFormation(Player* master, std::vector<BotInfo>& bots)
             case BotRole::ROLE_HEALER:     healers.push_back(&info);  break;
             case BotRole::ROLE_MELEE_HEALER: melee.push_back(&info); break;
             case BotRole::ROLE_RANGED_HEALER: healers.push_back(&info); break;
+            case BotRole::ROLE_RANGED_DOT: ranged.push_back(&info); break;
+            case BotRole::ROLE_MELEE_DOT:  melee.push_back(&info);  break;
         }
     }
 
@@ -786,28 +967,34 @@ static void ArrangeArrowFormation(Player* master, std::vector<BotInfo>& bots)
     float wingDist  = 7.0f;   // ranged/healers at the back wings
     float spread    = 0.35f;  // radians between bots in same row (~20 degrees)
 
+    // Slots use MotionMaster::MoveFollow (the same continuous, pathing-aware
+    // generator pets use), with the angle relative to the master's facing
+    // (PI = directly behind). This tracks the master every tick on its own,
+    // so we only need to (re)issue it when a bot's assigned slot actually
+    // changes — not recompute+restart the movement generator every second,
+    // which is what made bots look jittery/non-following at close range.
     auto placeRow = [&](std::vector<BotInfo*>& row, float dist)
     {
         int n = (int)row.size();
         if (n == 0) return;
-        float startAngle = behind - (float(n - 1) * spread * 0.5f);
+        float startOffset = -(float(n - 1) * spread * 0.5f);
         for (int i = 0; i < n; ++i)
         {
-            float angle = startAngle + float(i) * spread;
-            float x = masterX + dist * std::cos(angle);
-            float y = masterY + dist * std::sin(angle);
+            BotInfo* slot = row[i];
+            Player* bot = slot->player;
+            float relAngle = float(M_PI) + startOffset + float(i) * spread;
 
-            Player* bot = row[i]->player;
+            bool slotChanged = !slot->isFollowing ||
+                                std::fabs(slot->followDist - dist) > 0.01f ||
+                                std::fabs(slot->followAngle - relAngle) > 0.01f;
 
-            // Only reposition if significantly out of place (> 3 yards from slot)
-            float dx = bot->GetPositionX() - x;
-            float dy = bot->GetPositionY() - y;
-            float slotDist = std::sqrt(dx * dx + dy * dy);
-            if (slotDist > 3.0f)
+            if (slotChanged)
             {
-                row[i]->isFollowing = false;
+                slot->isFollowing = true;
+                slot->followDist  = dist;
+                slot->followAngle = relAngle;
                 bot->GetMotionMaster()->Clear();
-                bot->GetMotionMaster()->MovePoint(0, x, y, masterZ);
+                bot->GetMotionMaster()->MoveFollow(master, dist, relAngle);
             }
         }
     };
@@ -824,6 +1011,11 @@ static void UpdateBotAI(BotInfo& info, Player* master)
     Player* bot = info.player;
     if (!bot || !bot->IsInWorld() || !bot->IsAlive()) return;
     if (!master || !master->IsInWorld()) return;
+
+    // Re-applied every tick: aura recalculation (buffs/debuffs, mounting,
+    // etc.) recomputes speed from scratch and would otherwise silently wipe
+    // this out.
+    ApplyBotSpeedBonus(bot);
 
     const SpecRotation* rot = sRotationEngine.GetRotation(
         bot->getClass(), info.specIndex);
@@ -842,6 +1034,20 @@ static void UpdateBotAI(BotInfo& info, Player* master)
         {
             info.isInCombat  = true;
             info.isFollowing = false;
+
+            // ── Tap fix ─────────────────────────────────────────────────────
+            // Bots are real Player objects, so whichever one lands the first
+            // hit becomes the creature's loot recipient (see Unit::DealDamage).
+            // That bot is virtually always on the master's map, so the normal
+            // "pick a group member in range" fallback in Unit::Kill never
+            // triggers — the tapper's identity sticks, and quest-conditional
+            // loot / reputation get evaluated against the bot instead of the
+            // master. Force the master to be the tapper up front (before any
+            // bot's attack can land) so loot always resolves against the
+            // master and is shared with the whole party via MASTER_LOOT.
+            if (Creature* enemyCreature = enemy->ToCreature())
+                if (!enemyCreature->hasLootRecipient())
+                    enemyCreature->SetLootRecipient(master);
 
             bool isMelee = IsMeleeRole(info.role);
             bot->Attack(enemy, isMelee);
@@ -875,6 +1081,7 @@ static void UpdateBotAI(BotInfo& info, Player* master)
     if (info.isInCombat)
     {
         info.isInCombat = false;
+        info.isFollowing = false; // motion master was just wiped — force ArrangeArrowFormation to reissue MoveFollow
         bot->AttackStop();
         bot->GetMotionMaster()->Clear();
     }
@@ -891,6 +1098,38 @@ static void UpdateBotAI(BotInfo& info, Player* master)
     // Formation positioning is handled per-group in the world script tick
 }
 
+// ─── Post-Combat Resurrection ──────────────────────────────────────────────────
+// Bots are socketless Player objects: they never see the "Release Spirit" /
+// spirit-healer UI, so a bot that dies mid-fight would otherwise stay a
+// corpse forever with no way to recover. Once the master has been alive and
+// out of combat for POST_COMBAT_REVIVE_DELAY_MS (a "ready up" grace period —
+// avoids reviving mid-encounter during a brief lull between waves), bring
+// every fallen bot up at full health/mana and resume following, the same
+// way a GM `.revive` command would.
+static constexpr uint32 POST_COMBAT_REVIVE_DELAY_MS = 3000;
+
+static void ResurrectFallenBots(Player* master, std::vector<BotInfo>& bots)
+{
+    if (!master || !master->IsAlive()) return;
+
+    for (auto& info : bots)
+    {
+        Player* bot = info.player;
+        if (!bot || !bot->IsInWorld() || bot->IsAlive()) continue;
+
+        bot->RemoveAurasDueToSpell(27827); // Spirit of Redemption
+        bot->ResurrectPlayer(1.0f);
+        bot->SpawnCorpseBones();
+        bot->SaveToDB(false, false);
+        ApplyBotSpeedBonus(bot);
+
+        info.isInCombat  = false;
+        info.isFollowing = false;
+        bot->GetMotionMaster()->Clear();
+        bot->GetMotionMaster()->MoveFollow(master, 4.0f, float(M_PI));
+    }
+}
+
 // ─── World Script: tick loop ───────────────────────────────────────────────────
 class BotAIWorldScript : public WorldScript
 {
@@ -901,6 +1140,7 @@ public:
     {
         _timer += diff;
         if (_timer < AI_UPDATE_INTERVAL_MS) return;
+        uint32 elapsed = _timer;
         _timer = 0;
 
         auto& all = sBotMgr.GetAll();
@@ -916,14 +1156,28 @@ public:
             for (auto& info : bots)
                 UpdateBotAI(info, master);
 
-            // Out-of-combat: arrange arrow formation
-            if (!master->IsInCombat())
-                ArrangeArrowFormation(master, bots);
+            if (master->IsInCombat())
+            {
+                // Still fighting — reset the post-combat grace timer so a
+                // fallen bot can't be revived mid-encounter.
+                _outOfCombatTimers[masterLow] = 0;
+                continue;
+            }
+
+            // Post-combat "ready up": only revive the fallen once the master
+            // has stayed out of combat for the full grace period.
+            uint32& outOfCombatFor = _outOfCombatTimers[masterLow];
+            outOfCombatFor += elapsed;
+            if (outOfCombatFor >= POST_COMBAT_REVIVE_DELAY_MS)
+                ResurrectFallenBots(master, bots);
+
+            ArrangeArrowFormation(master, bots);
         }
     }
 
 private:
     uint32 _timer = 0;
+    std::unordered_map<ObjectGuid::LowType, uint32> _outOfCombatTimers;
 };
 
 void AddBotAI()

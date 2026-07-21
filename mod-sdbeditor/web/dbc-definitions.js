@@ -189,6 +189,201 @@ definitions['SpellIcon'] = {
   ],
 };
 
+// ── SpellVisualEffectName.dbc ────────────────────────────────────────────
+// The actual model + SCALE for a visual effect (missile/impact/precast/etc
+// model). Referenced by SpellVisual.MissileModel and by SpellVisualKit's
+// Head/Chest/Base/LeftHand/RightHand/... effect fields. Field order/names
+// verified against /root/SQL Export/SpellVisualEffectName.sql.
+definitions['SpellVisualEffectName'] = {
+  name: 'SpellVisualEffectName',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'Name', type: 'string' },
+    { name: 'FilePath', type: 'string' },
+    { name: 'AreaEffectSize', type: 'float' },
+    { name: 'Scale', type: 'float' },
+    { name: 'MinAllowedScale', type: 'float' },
+    { name: 'MaxAllowedScale', type: 'float' },
+  ],
+};
+
+// ── SpellVisual.dbc ───────────────────────────────────────────────────────
+// Referenced by Spell.SpellVisual_1/_2. `MissileModel` is a
+// SpellVisualEffectName ID - that's the actual projectile model+scale.
+// Field order/names verified against /root/SQL Export/SpellVisual.sql.
+definitions['SpellVisual'] = {
+  name: 'SpellVisual',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'PrecastKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'CastKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'ImpactKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'StateKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'StateDoneKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'ChannelKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'HasMissile', type: 'uint32' },
+    { name: 'MissileModel', type: 'int32', ref: 'SpellVisualEffectName' },
+    { name: 'MissilePathType', type: 'uint32' },
+    { name: 'MissileDestinationAttachment', type: 'uint32' },
+    { name: 'MissileSound', type: 'uint32' },
+    { name: 'AnimEventSoundId', type: 'uint32' },
+    { name: 'Flags', type: 'flags' },
+    { name: 'CasterImpactKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'TargetImpactKit', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'MissileAttachment', type: 'uint32' },
+    { name: 'MissileFollowGroundHeight', type: 'int32' },
+    { name: 'MissileFollowDropSpeed', type: 'uint32' },
+    { name: 'MissileFollowApproach', type: 'uint32' },
+    { name: 'MissileFollowGroundFlags', type: 'flags' },
+    { name: 'MissileMotion', type: 'uint32', ref: 'SpellMissileMotion' },
+    { name: 'MissileTargetingKit', type: 'uint32' },
+    { name: 'InstantAreaKit', type: 'uint32' },
+    { name: 'ImpactAreaKit', type: 'uint32' },
+    { name: 'PersistentAreaKit', type: 'uint32' },
+    { name: 'MissileCastOffsetX', type: 'float' },
+    { name: 'MissileCastOffsetY', type: 'float' },
+    { name: 'MissileCastOffsetZ', type: 'float' },
+    { name: 'MissileImpactOffsetX', type: 'float' },
+    { name: 'MissileImpactOffsetY', type: 'float' },
+    { name: 'MissileImpactOffsetZ', type: 'float' },
+  ],
+};
+
+// ── SpellVisualKit.dbc ────────────────────────────────────────────────────
+// Character-attached cast/impact effects (hand glow, chest effect, etc).
+// The *Effect fields are SpellVisualEffectName IDs too - a spell's "cast
+// glow"/"impact burst" scale lives here, separate from the missile itself.
+// Field order/names verified against /root/SQL Export/SpellVisualKit.sql.
+definitions['SpellVisualKit'] = {
+  name: 'SpellVisualKit',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'StartAnimId', type: 'int32' },
+    { name: 'AnimationId', type: 'uint32' },
+    { name: 'HeadEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'ChestEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'BaseEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'LeftHandEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'RightHandEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'BreathEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'LeftWeaponEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'RightWeaponEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'SpecialEffect1', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'SpecialEffect2', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'SpecialEffect3', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'WorldEffect', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'SoundID', type: 'uint32' },
+    { name: 'ShakeID', type: 'uint32' },
+    { name: 'CharProc1', type: 'uint32' },
+    { name: 'CharProc2', type: 'uint32' },
+    { name: 'CharProc3', type: 'uint32' },
+    { name: 'CharProc4', type: 'uint32' },
+    { name: 'CharParamZero1', type: 'float' },
+    { name: 'CharParamZero2', type: 'float' },
+    { name: 'CharParamZero3', type: 'float' },
+    { name: 'CharParamZero4', type: 'float' },
+    { name: 'CharParamOne1', type: 'float' },
+    { name: 'CharParamOne2', type: 'float' },
+    { name: 'CharParamOne3', type: 'float' },
+    { name: 'CharParamOne4', type: 'float' },
+    { name: 'CharParamTwo1', type: 'float' },
+    { name: 'CharParamTwo2', type: 'float' },
+    { name: 'CharParamTwo3', type: 'float' },
+    { name: 'CharParamTwo4', type: 'float' },
+    { name: 'CharParamThree1', type: 'float' },
+    { name: 'CharParamThree2', type: 'float' },
+    { name: 'CharParamThree3', type: 'float' },
+    { name: 'CharParamThree4', type: 'float' },
+    { name: 'Flags', type: 'flags' },
+  ],
+};
+
+// ── SpellMissile.dbc ──────────────────────────────────────────────────────
+// Projectile PHYSICS (speed/pitch/gravity) - not visual scale. Referenced
+// by Spell.SpellMissileID. Field order/names verified against
+// /root/SQL Export/SpellMissile.sql.
+definitions['SpellMissile'] = {
+  name: 'SpellMissile',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'flags', type: 'flags' },
+    { name: 'defaultPitchMin', type: 'float' },
+    { name: 'defaultPitchMax', type: 'float' },
+    { name: 'defaultSpeedMin', type: 'float' },
+    { name: 'defaultSpeedMax', type: 'float' },
+    { name: 'randomizeFacingMin', type: 'float' },
+    { name: 'randomizeFacingMax', type: 'float' },
+    { name: 'randomizePitchMin', type: 'float' },
+    { name: 'randomizePitchMax', type: 'float' },
+    { name: 'randomizeSpeedMin', type: 'float' },
+    { name: 'randomizeSpeedMax', type: 'float' },
+    { name: 'gravity', type: 'float' },
+    { name: 'maxDuration', type: 'float' },
+    { name: 'collisionRadius', type: 'float' },
+  ],
+};
+
+// ── SpellMissileMotion.dbc ────────────────────────────────────────────────
+// Named motion-script presets (Parabola, Spiral Vortex, etc) referenced by
+// SpellVisual.MissileMotion. Field order/names verified against
+// /root/SQL Export/SpellMissileMotion.sql.
+definitions['SpellMissileMotion'] = {
+  name: 'SpellMissileMotion',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'name', type: 'string' },
+    { name: 'script', type: 'string' },
+    { name: 'flags', type: 'flags' },
+    { name: 'missileCount', type: 'uint32' },
+  ],
+};
+
+// ── SpellVisualKitAreaModel.dbc ───────────────────────────────────────────
+// Ground-decal / area-effect models used by the "map builder" concept in
+// Stoneharry's tool (persistent-area visuals). Field order/names verified
+// against /root/SQL Export/SpellVisualKitAreaModel.sql.
+definitions['SpellVisualKitAreaModel'] = {
+  name: 'SpellVisualKitAreaModel',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'Name', type: 'string' },
+    { name: 'enumID', type: 'uint32' },
+  ],
+};
+
+// ── SpellVisualKitModelAttach.dbc ─────────────────────────────────────────
+// Attaches a SpellVisualEffectName model to a specific bone/attachment point
+// (with position offset + rotation) for a given SpellVisualKit. Field
+// order/names verified against /root/SQL Export/SpellVisualKitModelAttach.sql.
+definitions['SpellVisualKitModelAttach'] = {
+  name: 'SpellVisualKitModelAttach',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'ParentSpellVisualKitId', type: 'uint32', ref: 'SpellVisualKit' },
+    { name: 'SpellVisualEffectNameId', type: 'uint32', ref: 'SpellVisualEffectName' },
+    { name: 'AttachmentId', type: 'uint32' },
+    { name: 'OffsetX', type: 'float' },
+    { name: 'OffsetY', type: 'float' },
+    { name: 'OffsetZ', type: 'float' },
+    { name: 'Yaw', type: 'float' },
+    { name: 'Pitch', type: 'float' },
+    { name: 'Roll', type: 'float' },
+  ],
+};
+
+// ── SpellVisualPrecastTransitions.dbc ─────────────────────────────────────
+// Named anim-load/anim-hold pairs for precast (e.g. bow/rifle/thrown "ready"
+// stance transitions). Only 3 rows exist in retail. Field order/names
+// verified against /root/SQL Export/SpellVisualPrecastTransitions.sql.
+definitions['SpellVisualPrecastTransitions'] = {
+  name: 'SpellVisualPrecastTransitions',
+  fields: [
+    { name: 'ID', type: 'uint32' },
+    { name: 'PrecastLoadAnimName', type: 'string' },
+    { name: 'PrecastHoldAnimName', type: 'string' },
+  ],
+};
+
 // ── Spell.dbc (simplified – only key fields named) ──────────────────────
 // Full Spell.dbc has 234 fields; we name the commonly edited ones.
 definitions['Spell'] = {

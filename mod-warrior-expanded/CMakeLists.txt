@@ -1,2 +1,5 @@
 AC_ADD_SCRIPT(src/mod_warrior_expanded.cpp)
 AC_ADD_SCRIPT(src/HeroicStrikes.cpp)
+AC_ADD_SCRIPT(src/FuryMastery.cpp)
+AC_ADD_SCRIPT(src/Execute.cpp)
+AC_ADD_SCRIPT(src/SweepingStrikes.cpp)

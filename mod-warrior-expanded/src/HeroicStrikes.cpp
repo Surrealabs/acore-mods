@@ -40,13 +40,28 @@ public:
         if (!player || player->getClass() != CLASS_WARRIOR)
             return damage;
 
-        // Must have the passive aura
-        if (!player->HasAura(SPELL_HEROIC_STRIKES_PASSIVE))
+        // Must have the passive learned. Checking HasSpell() instead of HasAura() here on
+        // purpose: this is a self-cast (TARGET_UNIT_CASTER) Dummy aura, so it only actually
+        // gets applied if something casts it once after it's learned. If the talent system
+        // grants it by inserting straight into character_spell (no auto-cast on learn), the
+        // warrior has the spell but the aura is never actually up, and HasAura() silently
+        // never procs. HasSpell() only depends on spellbook knowledge, not aura state.
+        if (!player->HasSpell(SPELL_HEROIC_STRIKES_PASSIVE))
             return damage;
 
-        // Don't count hits on friendly targets or totems
-        if (!victim || !victim->IsAlive() || !player->IsHostileTo(victim))
+        // Any real attack target counts (including Training Dummies, which are friendly
+        // Creatures, not hostile, but perfectly valid to test/farm this rotation against).
+        // We only need to explicitly exclude the warrior themself and friendly players
+        // (party/raid members, or any other player not currently hostile - e.g. not dueling).
+        // Non-player targets (Training Dummies included) are never excluded by this check.
+        if (!victim || !victim->IsAlive() || victim == player)
             return damage;
+
+        if (Player* victimPlayer = victim->ToPlayer())
+        {
+            if (!player->IsHostileTo(victimPlayer))
+                return damage;
+        }
 
         // Increment auto-attack counter
         uint64 guid = player->GetGUID().GetCounter();
@@ -56,7 +71,10 @@ public:
         if (count >= ATTACKS_TO_TRIGGER)
         {
             count = 0;
-            player->CastSpell(victim, SPELL_HEROIC_STRIKE_CAST, true);
+            SpellCastResult result = player->CastSpell(victim, SPELL_HEROIC_STRIKE_CAST, true);
+            if (result != SPELL_CAST_OK)
+                LOG_ERROR("scripts", "mod_warrior_heroic_strikes: CastSpell({}) on {} by {} failed with result {}",
+                    uint32(SPELL_HEROIC_STRIKE_CAST), victim->GetGUID().ToString(), player->GetGUID().ToString(), uint32(result));
         }
 
         return damage;

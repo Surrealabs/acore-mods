@@ -122,7 +122,7 @@ const SpellIconEditor: React.FC<Props> = ({ textColor, contentBoxColor }) => {
   const [thumbStatus, setThumbStatus] = useState<string | null>(null);
   const [thumbRebuilding, setThumbRebuilding] = useState(false);
   const [importedIcons, setImportedIcons] = useState<ImportedIcon[]>([]);
-  const [mode, setMode] = useState<"browse" | "create">("browse");
+  const [mode, setMode] = useState<"browse" | "create" | "unlisted">("browse");
   const [existingDBC, setExistingDBC] = useState<SpellIconRecord[]>([]);
   const [dbcCompare, setDBCCompare] = useState<{ existing: Set<string>; new: Set<string> }>({
     existing: new Set(),
@@ -132,6 +132,18 @@ const SpellIconEditor: React.FC<Props> = ({ textColor, contentBoxColor }) => {
   const [unmappedIcons, setUnmappedIcons] = useState<string[]>([]);
   const [selectedUnmapped, setSelectedUnmapped] = useState<Set<string>>(new Set());
   const [config, setConfig] = useState<AppConfig | null>(null);
+
+  const [unlistedFiles, setUnlistedFiles] = useState<string[]>([]);
+  const [unlistedLoading, setUnlistedLoading] = useState(false);
+  const [unlistedError, setUnlistedError] = useState<string | null>(null);
+  const [unlistedSelected, setUnlistedSelected] = useState<Set<string>>(new Set());
+  const [unlistedSearchTerm, setUnlistedSearchTerm] = useState("");
+  const [unlistedImporting, setUnlistedImporting] = useState(false);
+  const [unlistedResult, setUnlistedResult] = useState<{
+    importedCount: number;
+    failedCount: number;
+    failed: Array<{ file: string; error: string }>;
+  } | null>(null);
 
   useEffect(() => {
     // Global error handler for this component
@@ -222,6 +234,94 @@ const SpellIconEditor: React.FC<Props> = ({ textColor, contentBoxColor }) => {
       setThumbStatus(`Thumbnail rebuild failed: ${err.message}`);
     } finally {
       setThumbRebuilding(false);
+    }
+  };
+
+  const loadUnlistedIcons = useCallback(async () => {
+    setUnlistedLoading(true);
+    setUnlistedError(null);
+    try {
+      const res = await fetch('/api/unlisted-icons');
+      const payload = await res.json();
+      if (!res.ok) throw new Error(payload.error || `Server returned ${res.status}`);
+      setUnlistedFiles(Array.isArray(payload.files) ? payload.files : []);
+    } catch (err: any) {
+      setUnlistedError(err.message || String(err));
+    } finally {
+      setUnlistedLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (mode === "unlisted") {
+      loadUnlistedIcons();
+    }
+  }, [mode, loadUnlistedIcons]);
+
+  const filteredUnlistedFiles = useMemo(() => {
+    const term = unlistedSearchTerm.trim().toLowerCase();
+    if (!term) return unlistedFiles;
+    return unlistedFiles.filter((f) => f.toLowerCase().includes(term));
+  }, [unlistedFiles, unlistedSearchTerm]);
+
+  const toggleUnlistedSelection = (file: string) => {
+    setUnlistedSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(file)) next.delete(file);
+      else next.add(file);
+      return next;
+    });
+  };
+
+  const selectAllFilteredUnlisted = () => {
+    setUnlistedSelected((prev) => {
+      const next = new Set(prev);
+      filteredUnlistedFiles.forEach((f) => next.add(f));
+      return next;
+    });
+  };
+
+  const clearUnlistedSelection = () => setUnlistedSelected(new Set());
+
+  const importSelectedUnlisted = async () => {
+    if (unlistedSelected.size === 0) {
+      setUnlistedError("No icons selected");
+      return;
+    }
+    setUnlistedImporting(true);
+    setUnlistedError(null);
+    setUnlistedResult(null);
+    try {
+      const res = await fetch('/api/unlisted-icons/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files: Array.from(unlistedSelected) }),
+      });
+      const payload = await res.json();
+      if (!res.ok && !payload) throw new Error(`Server returned ${res.status}`);
+
+      setUnlistedResult({
+        importedCount: payload.importedCount ?? 0,
+        failedCount: payload.failedCount ?? 0,
+        failed: Array.isArray(payload.failed) ? payload.failed : [],
+      });
+
+      const importedNames = new Set<string>((payload.imported || []).map((i: any) => i.file));
+      setUnlistedFiles((prev) => prev.filter((f) => !importedNames.has(f)));
+      setUnlistedSelected((prev) => {
+        const next = new Set(prev);
+        importedNames.forEach((f) => next.delete(f));
+        return next;
+      });
+      // Newly-imported icons now live in the main Icons folder; refresh the
+      // Browse tab's icon manifest so they show up there too.
+      if (importedNames.size > 0) {
+        setIcons((prev) => Array.from(new Set([...prev, ...Array.from(importedNames)])));
+      }
+    } catch (err: any) {
+      setUnlistedError(err.message || String(err));
+    } finally {
+      setUnlistedImporting(false);
     }
   };
 
@@ -565,6 +665,20 @@ const SpellIconEditor: React.FC<Props> = ({ textColor, contentBoxColor }) => {
         >
           Add New Icons
         </button>
+        <button
+          onClick={() => setMode("unlisted")}
+          style={{
+            padding: "10px 16px",
+            backgroundColor: mode === "unlisted" ? "#f59e0b" : "#ccc",
+            color: mode === "unlisted" ? "#fff" : "#000",
+            border: "none",
+            borderRadius: "4px",
+            cursor: "pointer",
+            fontWeight: "bold",
+          }}
+        >
+          Unlisted Icons{unlistedFiles.length > 0 ? ` (${unlistedFiles.length})` : ""}
+        </button>
       </div>
 
       {error && (
@@ -788,6 +902,176 @@ const SpellIconEditor: React.FC<Props> = ({ textColor, contentBoxColor }) => {
               ))
             )}
           </div>
+        </div>
+      )}
+
+      {mode === "unlisted" && (
+        <div>
+          <h3 style={{ textAlign: "left" }}>Unlisted Icons ({unlistedFiles.length})</h3>
+          <p style={{ fontSize: "14px", color: "#666" }}>
+            Icon files with no matching sdbeditor.spellicon row live here, kept out of the main
+            Icons folder. Select the ones you want and click Import to assign each a SpellIcon.dbc
+            ID, sync it to sdbeditor.spellicon, and move it back into the main folder — one step
+            instead of file + SQL + DBC separately.
+          </p>
+
+          <div style={{ marginBottom: "12px", display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              onClick={loadUnlistedIcons}
+              disabled={unlistedLoading}
+              style={{
+                padding: "8px 12px",
+                backgroundColor: unlistedLoading ? "#cbd5e1" : "#0ea5e9",
+                color: "#fff",
+                border: "none",
+                borderRadius: "4px",
+                cursor: unlistedLoading ? "not-allowed" : "pointer",
+                fontSize: "13px",
+                fontWeight: "bold",
+              }}
+            >
+              {unlistedLoading ? "Refreshing..." : "Refresh List"}
+            </button>
+            <button
+              onClick={selectAllFilteredUnlisted}
+              disabled={filteredUnlistedFiles.length === 0}
+              style={{
+                padding: "8px 12px",
+                backgroundColor: "#e2e8f0",
+                border: "1px solid #cbd5e1",
+                borderRadius: "4px",
+                cursor: filteredUnlistedFiles.length === 0 ? "not-allowed" : "pointer",
+                fontSize: "13px",
+              }}
+            >
+              Select All ({filteredUnlistedFiles.length})
+            </button>
+            <button
+              onClick={clearUnlistedSelection}
+              disabled={unlistedSelected.size === 0}
+              style={{
+                padding: "8px 12px",
+                backgroundColor: "#e2e8f0",
+                border: "1px solid #cbd5e1",
+                borderRadius: "4px",
+                cursor: unlistedSelected.size === 0 ? "not-allowed" : "pointer",
+                fontSize: "13px",
+              }}
+            >
+              Clear Selection
+            </button>
+            <button
+              onClick={importSelectedUnlisted}
+              disabled={unlistedImporting || unlistedSelected.size === 0}
+              style={{
+                padding: "8px 14px",
+                backgroundColor: unlistedImporting || unlistedSelected.size === 0 ? "#cbd5e1" : "#28a745",
+                color: "#fff",
+                border: "none",
+                borderRadius: "4px",
+                cursor: unlistedImporting || unlistedSelected.size === 0 ? "not-allowed" : "pointer",
+                fontSize: "13px",
+                fontWeight: "bold",
+              }}
+            >
+              {unlistedImporting ? "Importing..." : `Import Selected (${unlistedSelected.size})`}
+            </button>
+          </div>
+
+          <div style={{ marginBottom: "12px" }}>
+            <input
+              type="text"
+              placeholder="Search unlisted icons..."
+              value={unlistedSearchTerm}
+              onChange={(e) => setUnlistedSearchTerm(e.target.value)}
+              style={{
+                padding: "8px",
+                borderRadius: "4px",
+                border: "1px solid #ccc",
+                width: "100%",
+                fontSize: "14px",
+              }}
+            />
+          </div>
+
+          {unlistedError && (
+            <div style={{ color: "red", marginBottom: "12px", padding: "10px", backgroundColor: "#ffe7e7", borderRadius: "4px", fontSize: "13px" }}>
+              {unlistedError}
+            </div>
+          )}
+
+          {unlistedResult && (
+            <div style={{
+              marginBottom: "12px",
+              padding: "10px",
+              borderRadius: "4px",
+              fontSize: "13px",
+              backgroundColor: unlistedResult.failedCount ? "#fff7ed" : "#ecfdf5",
+              color: unlistedResult.failedCount ? "#9a3412" : "#166534",
+            }}>
+              Imported {unlistedResult.importedCount}, failed {unlistedResult.failedCount}.
+              {unlistedResult.failed.length > 0 && (
+                <ul style={{ margin: "6px 0 0 0", paddingLeft: "18px" }}>
+                  {unlistedResult.failed.map((f) => (
+                    <li key={f.file}>{f.file}: {f.error}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {unlistedLoading ? (
+            <p style={{ fontSize: "14px", color: "#666" }}>Loading unlisted icons...</p>
+          ) : filteredUnlistedFiles.length === 0 ? (
+            <p style={{ fontSize: "14px", color: "#666" }}>
+              {unlistedFiles.length === 0
+                ? "No unlisted icons — everything in the main folder is known to sdbeditor.spellicon."
+                : "No icons match your search."}
+            </p>
+          ) : (
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))",
+              gap: "12px",
+            }}>
+              {filteredUnlistedFiles.map((file) => {
+                const checked = unlistedSelected.has(file);
+                return (
+                  <div
+                    key={file}
+                    onClick={() => toggleUnlistedSelection(file)}
+                    style={{
+                      border: checked ? "2px solid #28a745" : "1px solid #ccc",
+                      borderRadius: "6px",
+                      padding: "8px",
+                      cursor: "pointer",
+                      backgroundColor: checked ? "#ecfdf5" : "#fff",
+                      textAlign: "center",
+                    }}
+                  >
+                    <div style={{ position: "relative", width: "64px", height: "64px", margin: "0 auto 6px auto" }}>
+                      <img
+                        src={getThumbnailUrl(file)}
+                        alt={file}
+                        loading="lazy"
+                        style={{ width: "64px", height: "64px", objectFit: "cover", borderRadius: "4px" }}
+                      />
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleUnlistedSelection(file)}
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ position: "absolute", top: 2, left: 2 }}
+                      />
+                    </div>
+                    <div style={{ fontSize: "11px", wordBreak: "break-all", color: "#334155" }}>
+                      {file}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

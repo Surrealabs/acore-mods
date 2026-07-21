@@ -14,21 +14,24 @@ uint32 CountKnownSpellsForRotation(Player* bot, SpecRotation const& rot)
         return 0;
 
     uint32 score = 0;
-    auto countBucket = [&](std::array<uint32, SPELLS_PER_BUCKET> const& bucket)
+    auto countOne = [&](uint32 spellId)
+    {
+        if (spellId && bot->HasSpell(spellId))
+            ++score;
+    };
+    auto countBucket = [&](auto const& bucket)
     {
         for (uint32 spellId : bucket)
-        {
-            if (spellId && bot->HasSpell(spellId))
-                ++score;
-        }
+            countOne(spellId);
     };
 
-    countBucket(rot.abilities);
-    countBucket(rot.buffs);
+    countOne(rot.filler);
+    countBucket(rot.rotation);
+    countOne(rot.interrupt);
+    countOne(rot.mobility);
     countBucket(rot.defensives);
-    countBucket(rot.dots);
-    countBucket(rot.hots);
-    countBucket(rot.mobility);
+    countOne(rot.damageCooldown);
+    countOne(rot.partyBuff);
     return score;
 }
 }
@@ -43,7 +46,38 @@ static BotRole RoleFromString(std::string_view s)
     if (s == "ranged_dps") return BotRole::ROLE_RANGED_DPS;
     if (s == "melee_healer") return BotRole::ROLE_MELEE_HEALER;
     if (s == "ranged_healer") return BotRole::ROLE_RANGED_HEALER;
+    if (s == "ranged_dot") return BotRole::ROLE_RANGED_DOT;
+    if (s == "melee_dot")  return BotRole::ROLE_MELEE_DOT;
     return BotRole::ROLE_MELEE_DPS;
+}
+
+// "1-4-5-f-2-4-5-f-3-4-5-f" -> {0,3,4,5,1,3,4,5,2,3,4,5}
+std::vector<uint8_t> ParseRotationSequence(std::string const& s)
+{
+    std::vector<uint8_t> steps;
+    std::string token;
+    auto flush = [&]()
+    {
+        if (token.empty())
+            return;
+        if (token == "f" || token == "F")
+            steps.push_back(SEQUENCE_FILLER_STEP);
+        else if (token.size() == 1 && token[0] >= '1' && token[0] <= ('0' + ROTATION_SLOTS))
+            steps.push_back(uint8_t(token[0] - '1'));
+        // else: unrecognized token, silently skipped
+        token.clear();
+    };
+
+    for (char c : s)
+    {
+        if (c == '-')
+            flush();
+        else
+            token += c;
+    }
+    flush();
+
+    return steps;
 }
 
 // ─── Load From DB ──────────────────────────────────────────────────────────────
@@ -55,12 +89,11 @@ uint32 RotationEngine::LoadFromDB()
     //  SELECT mirrors the column order in the CREATE TABLE
     QueryResult result = CharacterDatabase.Query(
         "SELECT class_id, spec_index, spec_name, role, preferred_range, "
-        "       ability_1, ability_2, ability_3, ability_4, ability_5, "
-        "       buff_1, buff_2, buff_3, buff_4, buff_5, "
-        "       defensive_1, defensive_2, defensive_3, defensive_4, defensive_5, "
-        "       dot_1, dot_2, dot_3, dot_4, dot_5, "
-        "       hot_1, hot_2, hot_3, hot_4, hot_5, "
-        "       mobility_1, mobility_2, mobility_3, mobility_4, mobility_5 "
+        "       filler, "
+        "       rotation_1, rotation_2, rotation_3, rotation_4, rotation_5, "
+        "       interrupt, mobility, "
+        "       defensive_1, defensive_2, "
+        "       damage_cooldown, party_buff, rotation_sequence "
         "FROM rpgbots.bot_rotations");
 
     if (!result)
@@ -79,29 +112,22 @@ uint32 RotationEngine::LoadFromDB()
         rot.role           = RoleFromString(f[3].Get<std::string>());
         rot.preferredRange = f[4].Get<float>();
 
-        // 5 abilities  (columns 5-9)
-        for (uint8 i = 0; i < SPELLS_PER_BUCKET; ++i)
-            rot.abilities[i] = f[5 + i].Get<uint32>();
+        rot.filler = f[5].Get<uint32>();
 
-        // 5 buffs      (columns 10-14)
-        for (uint8 i = 0; i < SPELLS_PER_BUCKET; ++i)
-            rot.buffs[i] = f[10 + i].Get<uint32>();
+        // 5 rotation slots (columns 6-10)
+        for (uint8 i = 0; i < ROTATION_SLOTS; ++i)
+            rot.rotation[i] = f[6 + i].Get<uint32>();
 
-        // 5 defensives (columns 15-19)
-        for (uint8 i = 0; i < SPELLS_PER_BUCKET; ++i)
-            rot.defensives[i] = f[15 + i].Get<uint32>();
+        rot.interrupt = f[11].Get<uint32>();
+        rot.mobility  = f[12].Get<uint32>();
 
-        // 5 dots       (columns 20-24)
-        for (uint8 i = 0; i < SPELLS_PER_BUCKET; ++i)
-            rot.dots[i] = f[20 + i].Get<uint32>();
+        // 2 defensive slots (columns 13-14)
+        for (uint8 i = 0; i < DEFENSIVE_SLOTS; ++i)
+            rot.defensives[i] = f[13 + i].Get<uint32>();
 
-        // 5 hots       (columns 25-29)
-        for (uint8 i = 0; i < SPELLS_PER_BUCKET; ++i)
-            rot.hots[i] = f[25 + i].Get<uint32>();
-
-        // 5 mobility   (columns 30-34)
-        for (uint8 i = 0; i < SPELLS_PER_BUCKET; ++i)
-            rot.mobility[i] = f[30 + i].Get<uint32>();
+        rot.damageCooldown = f[15].Get<uint32>();
+        rot.partyBuff      = f[16].Get<uint32>();
+        rot.sequenceSteps  = ParseRotationSequence(f[17].Get<std::string>());
 
         SpecKey key = MakeSpecKey(rot.classId, rot.specIndex);
         _rotations[key] = std::move(rot);

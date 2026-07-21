@@ -1,0 +1,38 @@
+-- Run this LAST, after bot_rotations_12column_migration.sql +
+-- migrate_to_12column.js have added and populated the new 12-column layout.
+-- Drops all the old 6-bucket/30-slot columns that are no longer used.
+
+ALTER TABLE `bot_rotations`
+    DROP COLUMN `ability_1`,
+    DROP COLUMN `ability_2`,
+    DROP COLUMN `ability_3`,
+    DROP COLUMN `ability_4`,
+    DROP COLUMN `ability_5`,
+    DROP COLUMN `buff_1`,
+    DROP COLUMN `buff_2`,
+    DROP COLUMN `buff_3`,
+    DROP COLUMN `buff_4`,
+    DROP COLUMN `buff_5`,
+    DROP COLUMN `defensive_3`,
+    DROP COLUMN `defensive_4`,
+    DROP COLUMN `defensive_5`,
+    DROP COLUMN `dot_1`,
+    DROP COLUMN `dot_2`,
+    DROP COLUMN `dot_3`,
+    DROP COLUMN `dot_4`,
+    DROP COLUMN `dot_5`,
+    DROP COLUMN `hot_1`,
+    DROP COLUMN `hot_2`,
+    DROP COLUMN `hot_3`,
+    DROP COLUMN `hot_4`,
+    DROP COLUMN `hot_5`,
+    DROP COLUMN `mobility_1`,
+    DROP COLUMN `mobility_2`,
+    DROP COLUMN `mobility_3`,
+    DROP COLUMN `mobility_4`,
+    DROP COLUMN `mobility_5`,
+    DROP COLUMN `filler_1`,
+    DROP COLUMN `filler_2`,
+    DROP COLUMN `filler_3`,
+    DROP COLUMN `filler_4`,
+    DROP COLUMN `filler_5`;

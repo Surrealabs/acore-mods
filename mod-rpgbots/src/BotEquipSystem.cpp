@@ -3,9 +3,9 @@
 //   .army equip <name>   — Auto-equip best items from bags (by item level)
 //   .army gear  <name>   — Show currently equipped gear
 //
-// Master Loot works natively: bots are real Player objects in the group,
-// so the master can assign loot items to them just like normal players.
-// After assigning loot, use `.army equip <name>` to auto-equip upgrades.
+// The party uses Free For All loot (see ArmyOfAlts.cpp), so the master loots
+// every kill directly. Hand gear to a bot via the normal trade window, then
+// run `.army equip <name>` to auto-equip any upgrades from its bags.
 
 #include "ScriptMgr.h"
 #include "Chat.h"

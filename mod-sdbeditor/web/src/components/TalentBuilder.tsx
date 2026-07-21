@@ -19,6 +19,31 @@ type Talent = {
   prereqRanks?: number[];
   iconPath?: string | null;
   sprite?: SpriteInfo | null;
+  mastery?: boolean;
+};
+
+type SpecLayout = {
+  classCols: number;
+  specColStart: number;
+  specCols: number;
+  heroColStart: number;
+  heroCols: number;
+  mainRows: number;
+  hero1RowStart: number;
+  hero1Rows: number;
+  hero2RowStart: number;
+  hero2Rows: number;
+  totalCols: number;
+  totalRows: number;
+};
+
+type Spec = {
+  tabId: number;
+  name?: string;
+  rows?: number;
+  cols?: number;
+  layout?: SpecLayout;
+  talents: Talent[];
 };
 
 type Props = {
@@ -29,8 +54,13 @@ type Props = {
 };
 
 const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmLevel = 0 }) => {
-  const [selectedClass, setSelectedClass] = useState<string>('warrior');
-  const [specs, setSpecs] = useState<any[]>([]);
+  // No class is selected by default — the builder starts on a bare class-icon
+  // picker, then reveals spec selection, then hero-tree selection, mirroring
+  // the in-game flow (class -> spec -> hero talent tree).
+  const [selectedClass, setSelectedClass] = useState<string | null>(null);
+  const [selectedSpecIdx, setSelectedSpecIdx] = useState<number | null>(null);
+  const [selectedHeroIdx, setSelectedHeroIdx] = useState<number | null>(null);
+  const [specs, setSpecs] = useState<Spec[]>([]);
   const [loading, setLoading] = useState(false);
   const [tabNames, setTabNames] = useState<{ [key: number]: string }>({});
   const [spriteIconSize, setSpriteIconSize] = useState(64);
@@ -64,8 +94,13 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
     fetchTabNames();
   }, []);
 
-  // Fetch talent data when class changes
+  // Fetch talent data when class changes (no class selected = no fetch)
   useEffect(() => {
+    if (!selectedClass) {
+      setSpecs([]);
+      return;
+    }
+
     let isMounted = true;
 
     const fetchTalents = async () => {
@@ -102,15 +137,22 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
     };
   }, [selectedClass]);
 
-  // Reset points on class change
+  // Reset points and spec/hero selection on class change
   useEffect(() => {
     setAllocatedPoints({});
+    setSelectedSpecIdx(null);
+    setSelectedHeroIdx(null);
   }, [selectedClass]);
+
+  // Reset hero-tree selection whenever the spec changes
+  useEffect(() => {
+    setSelectedHeroIdx(null);
+  }, [selectedSpecIdx]);
 
   // Point allocation helpers
   const totalSpent = Object.values(allocatedPoints).reduce((sum, v) => sum + v, 0);
   const pointsInSpec = (tabId: number): number => {
-    const spec = specs.find((s: any) => s.tabId === tabId);
+    const spec = specs.find((s) => s.tabId === tabId);
     if (!spec) return 0;
     return (spec.talents || []).reduce((sum: number, t: Talent) => sum + (allocatedPoints[t.id] || 0), 0);
   };
@@ -150,7 +192,7 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
 
   const encodeTalentString = useCallback((): string => {
     if (specs.length === 0) return '';
-    const trees: string[] = specs.map((spec: any) => {
+    const trees: string[] = specs.map((spec) => {
       const sorted = [...(spec.talents || [])].sort((a: Talent, b: Talent) => a.row - b.row || a.column - b.column);
       const digits = sorted.map((t: Talent) => String(allocatedPoints[t.id] || 0));
       // Trim trailing zeros
@@ -166,7 +208,7 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
     const trees = str.split('-');
     const newPoints: { [talentId: number]: number } = {};
 
-    specs.forEach((spec: any, treeIdx: number) => {
+    specs.forEach((spec, treeIdx: number) => {
       const treeStr = trees[treeIdx] || '';
       const sorted = [...(spec.talents || [])].sort((a: Talent, b: Talent) => a.row - b.row || a.column - b.column);
       sorted.forEach((t: Talent, i: number) => {
@@ -248,6 +290,7 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
     warrior: 1, paladin: 2, hunter: 3, rogue: 4, priest: 5,
     'death-knight': 6, shaman: 7, mage: 8, warlock: 9, druid: 11,
   };
+  const selectedClassId = selectedClass ? classNameToId[selectedClass] : undefined;
 
 
   const classes = [
@@ -343,6 +386,95 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
 
   const getSpecBackground = (className: string, specBg: string) => {
     return `http://${window.location.hostname}:3001/class-backgrounds/bg-${className}-${specBg}.jpg`;
+  };
+
+  // Representative icon for a spec's compact picker tile: prefer the spec's
+  // mastery-flagged talent's icon (mirrors retail's spec-select screen, which
+  // shows the mastery icon), falling back to the first talent by row/col, and
+  // finally to the classic WoW "unknown" icon when nothing is available yet.
+  const getSpecIconPath = (spec: Spec): string => {
+    const talents = spec.talents || [];
+    const mastery = talents.find((t: Talent) => t.mastery);
+    if (mastery?.iconPath) return mastery.iconPath;
+    const sorted = [...talents].sort((a: Talent, b: Talent) => a.row - b.row || a.column - b.column);
+    return sorted[0]?.iconPath || 'INV_Misc_QuestionMark';
+  };
+
+  // Shared talent-cell renderer used by both the main spec grid and the
+  // hero-tree grid so the two don't duplicate this large block of JSX/styles.
+  const renderTalentCell = (talent: Talent | undefined, cellIdx: number) => {
+    const pts = talent ? (allocatedPoints[talent.id] || 0) : 0;
+    const maxR = talent?.maxRank || 1;
+    const canAdd = talent ? canAllocate(talent) : false;
+    const isMaxed = pts >= maxR;
+    const hasPoints = pts > 0;
+
+    return (
+      <div
+        key={cellIdx}
+        title={talent ? `#${talent.id} | Spell: ${talent.spellId} | ${pts}/${maxR} ranks${talent.spellRanks ? '\nRanks: ' + talent.spellRanks.filter((s: number) => s > 0).join(', ') : ''}` : undefined}
+        onClick={() => talent && addPoint(talent)}
+        onContextMenu={(e) => { e.preventDefault(); talent && removePoint(talent); }}
+        style={{
+          width: 40,
+          height: 40,
+          background: talent ? '#2a2a2a' : 'rgba(255,255,255,0.1)',
+          borderRadius: 4,
+          border: talent
+            ? isMaxed
+              ? '2px solid #FFD700'
+              : hasPoints
+                ? '2px solid #4CAF50'
+                : canAdd
+                  ? '2px solid #666'
+                  : '2px solid #444'
+            : '1px solid rgba(255,255,255,0.3)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          cursor: talent ? (canAdd ? 'pointer' : 'default') : 'default',
+          transition: 'all 0.2s ease',
+          overflow: 'hidden',
+          position: 'relative',
+          opacity: talent ? (canAdd || hasPoints ? 1 : 0.5) : 1,
+        }}
+        onMouseEnter={(e) => {
+          if (talent) {
+            (e.currentTarget as HTMLElement).style.transform = 'scale(1.15)';
+            (e.currentTarget as HTMLElement).style.zIndex = '10';
+            (e.currentTarget as HTMLElement).style.boxShadow = '0 0 12px rgba(76, 175, 80, 0.8)';
+          }
+        }}
+        onMouseLeave={(e) => {
+          if (talent) {
+            (e.currentTarget as HTMLElement).style.transform = 'scale(1)';
+            (e.currentTarget as HTMLElement).style.zIndex = '1';
+            (e.currentTarget as HTMLElement).style.boxShadow = 'none';
+          }
+        }}
+      >
+        {talent && (
+          <>
+            <TalentIcon iconPath={talent.iconPath} sprite={talent.sprite || null} size={36} spriteIconSize={spriteIconSize} spriteIconsPerRow={spriteIconsPerRow} />
+            {/* Rank badge */}
+            <div style={{
+              position: 'absolute',
+              bottom: 0,
+              right: 0,
+              background: 'rgba(0,0,0,0.85)',
+              color: isMaxed ? '#FFD700' : hasPoints ? '#4CAF50' : '#888',
+              fontSize: 9,
+              fontWeight: 'bold',
+              padding: '0 3px',
+              borderRadius: '3px 0 0 0',
+              lineHeight: '14px',
+            }}>
+              {pts}/{maxR}
+            </div>
+          </>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -449,7 +581,7 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
           ) : (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
               {characters
-                .filter(c => c.class === classNameToId[selectedClass])
+                .filter(c => c.class === selectedClassId)
                 .map(c => (
                   <button
                     key={c.guid}
@@ -475,7 +607,7 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
                   </button>
                 ))
               }
-              {characters.filter(c => c.class === classNameToId[selectedClass]).length === 0 && (
+              {characters.filter(c => c.class === selectedClassId).length === 0 && (
                 <p style={{ fontSize: 12, color: '#999' }}>No {selectedClass} characters on your account.</p>
               )}
             </div>
@@ -488,6 +620,7 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
         </div>
       )}
 
+      {/* Step 1: Select Class — no class is selected by default, just the icons */}
       <div style={{ marginBottom: 16 }}>
         <label style={{ fontWeight: 'bold' }}>Select Class:</label>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 16, marginTop: 8 }}>
@@ -531,163 +664,258 @@ const TalentBuilder: React.FC<Props> = ({ textColor, contentBoxColor, token, gmL
         </div>
       </div>
 
-      <div
-        style={{
-          border: '1px solid #ddd',
-          borderRadius: 8,
-          padding: 16,
-          background: contentBoxColor,
-          color: textColor,
-        }}
-      >
-        <h3 style={{ marginTop: 0, marginBottom: 16, textTransform: 'capitalize', color: textColor }}>
-          {selectedClass.replace('-', ' ')} Talent Trees
-        </h3>
-        
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
-          {specs.map((spec, idx) => {
-            const specName = tabNames[spec.tabId] || `Tree ${idx + 1}`;
-            const bgSpec = classSpecs[selectedClass]?.find(s => s.name === specName);
-            return (
-              <div 
-                key={idx} 
-                style={{ 
-                  borderRadius: 8, 
-                  overflow: 'hidden',
-                  border: '1px solid #ddd',
-                  position: 'relative',
-                  backgroundImage: bgSpec ? `url(${getSpecBackground(selectedClass === 'death-knight' ? 'deathknight' : selectedClass, bgSpec.bg)})` : 'none',
+      {/* Step 2: Select Spec — only shown once a class has been picked */}
+      {selectedClass && (
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ fontWeight: 'bold' }}>Select Spec:</label>
+          <div style={{ display: 'flex', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
+            {loading && (
+              <p style={{ opacity: 0.6, margin: 0 }}>⏳ Loading specs...</p>
+            )}
+            {!loading && specs.length === 0 && (
+              <p style={{ opacity: 0.6, margin: 0 }}>No specs configured for this class yet.</p>
+            )}
+            {!loading && specs.map((spec, idx) => {
+              const specName = spec.name || tabNames[spec.tabId] || `Spec ${idx + 1}`;
+              const iconPath = getSpecIconPath(spec);
+              const isSelected = selectedSpecIdx === idx;
+              return (
+                <div
+                  key={spec.tabId ?? idx}
+                  onClick={() => setSelectedSpecIdx(idx)}
+                  style={{
+                    cursor: 'pointer',
+                    width: 76,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 6,
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 48,
+                      height: 48,
+                      borderRadius: 8,
+                      overflow: 'hidden',
+                      boxShadow: isSelected
+                        ? '0 0 16px 4px rgba(0, 123, 255, 0.8)'
+                        : '0 2px 4px rgba(0,0,0,0.2)',
+                      border: isSelected ? '2px solid #007bff' : '2px solid transparent',
+                      transition: 'all 0.2s ease',
+                    }}
+                  >
+                    <TalentIcon iconPath={iconPath} size={48} />
+                  </div>
+                  <span style={{
+                    fontSize: 12,
+                    textAlign: 'center',
+                    color: textColor,
+                    fontWeight: isSelected ? 'bold' : 'normal',
+                  }}>
+                    {specName}
+                  </span>
+                  <span style={{ fontSize: 10, color: '#4FC3F7' }}>
+                    {pointsInSpec(spec.tabId)} pts
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Step 3: Talent tree + hero-tree selection — only shown once a spec has been picked */}
+      {selectedClass && selectedSpecIdx !== null && specs[selectedSpecIdx] && (() => {
+        const spec = specs[selectedSpecIdx];
+        const specName = spec.name || tabNames[spec.tabId] || `Spec ${selectedSpecIdx + 1}`;
+        const bgSpec = classSpecs[selectedClass]?.[selectedSpecIdx];
+        const layout = spec.layout;
+        const talentsList = spec.talents || [];
+
+        // Spec-tree zone: columns/rows come from the server's layout metadata
+        // (matches Talent Editor's combined class/spec/hero coordinate space).
+        // Falls back to a plain 4x11 grid with no column offset for the legacy
+        // DBC-sourced path, which has no layout/mastery metadata.
+        const gridCols = layout?.specCols ?? 4;
+        const gridRows = layout?.mainRows ?? 11;
+        const colOffset = layout?.specColStart ?? 0;
+
+        // Prefer the explicit mastery flag; fall back to the old
+        // "first talent by row/col" heuristic when no flag is present
+        // (legacy DBC-sourced data has no mastery metadata at all).
+        const flaggedMastery = talentsList.find((t: Talent) => t.mastery);
+        const masteryId = flaggedMastery
+          ? flaggedMastery.id
+          : [...talentsList].sort((a: Talent, b: Talent) => a.row - b.row || a.column - b.column)[0]?.id;
+
+        // Hero-tree zone: only present when the server's layout metadata says so
+        // (i.e. the JSON-config path). Legacy DBC-fallback data has no hero trees.
+        const hasHeroTrees = !!layout && layout.heroCols > 0;
+        const heroCols = layout?.heroCols ?? 3;
+        const heroRows = layout?.hero1Rows ?? 5;
+        const heroColOffset = layout?.heroColStart ?? -1;
+        const heroRowOffset = selectedHeroIdx === 1
+          ? (layout?.hero2RowStart ?? heroRows)
+          : (layout?.hero1RowStart ?? 0);
+
+        // Representative icon for a hero tree's selector button: the first
+        // talent in that tree (by row/col order), falling back to the classic
+        // question-mark icon when the tree has no talents placed yet.
+        const getHeroIconPath = (heroIdx: number): string => {
+          const rowStart = heroIdx === 1 ? (layout?.hero2RowStart ?? heroRows) : (layout?.hero1RowStart ?? 0);
+          const heroTalents = talentsList.filter((t: Talent) => {
+            const localRow = t.row - rowStart;
+            const localCol = t.column - heroColOffset;
+            return localRow >= 0 && localRow < heroRows && localCol >= 0 && localCol < heroCols;
+          });
+          const sorted = [...heroTalents].sort(
+            (a: Talent, b: Talent) => (a.row - rowStart) - (b.row - rowStart) || (a.column - heroColOffset) - (b.column - heroColOffset)
+          );
+          return sorted[0]?.iconPath || 'INV_Misc_QuestionMark';
+        };
+
+        // Class-tree zone: talents shared by every spec of this class, always
+        // occupying columns 0..classCols-1 with no offset (Talent Editor stores
+        // them unshifted). Same row count as the hero side-trees (SIDE_TREE_ROWS).
+        // Only present for the JSON-config path — legacy DBC fallback has no layout.
+        const hasClassTree = !!layout && layout.classCols > 0;
+        const classCols = layout?.classCols ?? 3;
+        const classRows = layout?.hero1Rows ?? 5;
+
+        return (
+          <div
+            style={{
+              border: '1px solid #ddd',
+              borderRadius: 8,
+              padding: 16,
+              background: contentBoxColor,
+              color: textColor,
+              position: 'relative',
+              overflow: 'hidden',
+            }}
+          >
+            {bgSpec && (
+              <div
+                style={{
+                  position: 'absolute',
+                  top: 0, left: 0, right: 0, bottom: 0,
+                  backgroundImage: `url(${getSpecBackground(selectedClass === 'death-knight' ? 'deathknight' : selectedClass, bgSpec.bg)})`,
                   backgroundSize: 'cover',
                   backgroundPosition: 'center',
                 }}
-              >
-              {/* Dark overlay for readability */}
-              <div 
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  bottom: 0,
-                  background: 'rgba(0, 0, 0, 0.6)',
-                }}
               />
-              {/* Content */}
-              <div style={{ position: 'relative', zIndex: 1 }}>
-                {/* Spec Header */}
-                <div style={{ padding: 12, borderBottom: '1px solid rgba(255,255,255,0.2)' }}>
-                  <h4 
-                    style={{ 
-                      marginTop: 0, 
-                      marginBottom: 0,
-                      textAlign: 'center',
-                      color: '#fff',
-                      textShadow: '2px 2px 4px rgba(0,0,0,0.8)',
-                    }}
-                  >
-                    {specName || `Tree ${idx + 1}`}
-                    <span style={{ fontSize: 12, fontWeight: 'normal', opacity: 0.7, marginLeft: 6 }}>
-                      ({pointsInSpec(spec.tabId)})
-                    </span>
-                  </h4>
-                </div>
-                {/* Talent Grid */}
-                <div style={{ padding: 12 }}>
-                  {(() => {
-                    // Identify mastery talent (first per spec by row/col) — hidden, handled by spec selection
-                    const sorted = [...(spec.talents || [])].sort((a: Talent, b: Talent) => a.row - b.row || a.column - b.column);
-                    const masteryId = sorted[0]?.id;
-                    return (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4 }}>
-                    {Array.from({ length: 44 }).map((_, idx) => {
-                      const row = Math.floor(idx / 4);
-                      const col = idx % 4;
-                      const talent = spec.talents?.find(
-                        (t: Talent) => t.row === row && t.column === col && t.id !== masteryId
-                      );
-                      const pts = talent ? (allocatedPoints[talent.id] || 0) : 0;
-                      const maxR = talent?.maxRank || 1;
-                      const canAdd = talent ? canAllocate(talent) : false;
-                      const isMaxed = pts >= maxR;
-                      const hasPoints = pts > 0;
-                      
-                      return (
-                        <div
-                          key={idx}
-                          title={talent ? `#${talent.id} | Spell: ${talent.spellId} | ${pts}/${maxR} ranks${talent.spellRanks ? '\nRanks: ' + talent.spellRanks.filter((s: number) => s > 0).join(', ') : ''}` : undefined}
-                          onClick={() => talent && addPoint(talent)}
-                          onContextMenu={(e) => { e.preventDefault(); talent && removePoint(talent); }}
-                          style={{
-                            width: 40,
-                            height: 40,
-                            background: talent ? '#2a2a2a' : 'rgba(255,255,255,0.1)',
-                            borderRadius: 4,
-                            border: talent 
-                              ? isMaxed
-                                ? '2px solid #FFD700'
-                                : hasPoints
-                                  ? '2px solid #4CAF50'
-                                  : canAdd
-                                    ? '2px solid #666'
-                                    : '2px solid #444'
-                              : '1px solid rgba(255,255,255,0.3)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                            cursor: talent ? (canAdd ? 'pointer' : 'default') : 'default',
-                            transition: 'all 0.2s ease',
-                            overflow: 'hidden',
-                            position: 'relative',
-                            opacity: talent ? (canAdd || hasPoints ? 1 : 0.5) : 1,
-                          }}
-                          onMouseEnter={(e) => {
-                            if (talent) {
-                              (e.currentTarget as HTMLElement).style.transform = 'scale(1.15)';
-                              (e.currentTarget as HTMLElement).style.zIndex = '10';
-                              (e.currentTarget as HTMLElement).style.boxShadow = '0 0 12px rgba(76, 175, 80, 0.8)';
-                            }
-                          }}
-                          onMouseLeave={(e) => {
-                            if (talent) {
-                              (e.currentTarget as HTMLElement).style.transform = 'scale(1)';
-                              (e.currentTarget as HTMLElement).style.zIndex = '1';
-                              (e.currentTarget as HTMLElement).style.boxShadow = 'none';
-                            }
-                          }}
-                        >
-                          {talent && (
-                            <>
-                              <TalentIcon sprite={talent.sprite || null} size={36} spriteIconSize={spriteIconSize} spriteIconsPerRow={spriteIconsPerRow} />
-                              {/* Rank badge */}
-                              <div style={{
-                                position: 'absolute',
-                                bottom: 0,
-                                right: 0,
-                                background: 'rgba(0,0,0,0.85)',
-                                color: isMaxed ? '#FFD700' : hasPoints ? '#4CAF50' : '#888',
-                                fontSize: 9,
-                                fontWeight: 'bold',
-                                padding: '0 3px',
-                                borderRadius: '3px 0 0 0',
-                                lineHeight: '14px',
-                              }}>
-                                {pts}/{maxR}
-                              </div>
-                            </>
-                          )}
-                        </div>
-                      );
-                    })}
+            )}
+            {bgSpec && (
+              <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.6)' }} />
+            )}
+            <div style={{ position: 'relative', zIndex: 1 }}>
+              <h3 style={{ marginTop: 0, marginBottom: 16, color: bgSpec ? '#fff' : textColor, textShadow: bgSpec ? '2px 2px 4px rgba(0,0,0,0.8)' : 'none' }}>
+                {specName} Talent Tree
+                <span style={{ fontSize: 12, fontWeight: 'normal', opacity: 0.7, marginLeft: 6 }}>
+                  ({pointsInSpec(spec.tabId)} pts)
+                </span>
+              </h3>
+
+              <div style={{ display: 'flex', gap: 32, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+                {/* Class tree — shared across every spec of this class */}
+                {hasClassTree && (
+                  <div>
+                    <label style={{ fontWeight: 'bold', color: bgSpec ? '#fff' : textColor, textShadow: bgSpec ? '2px 2px 4px rgba(0,0,0,0.8)' : 'none' }}>
+                      Class Talents:
+                    </label>
+                    <div style={{ display: 'grid', gridTemplateColumns: `repeat(${classCols}, 1fr)`, gap: 4, marginTop: 8 }}>
+                      {Array.from({ length: classRows * classCols }).map((_, cellIdx) => {
+                        const row = Math.floor(cellIdx / classCols);
+                        const col = cellIdx % classCols;
+                        const talent = talentsList.find(
+                          (t: Talent) => t.row === row && t.column === col
+                        );
+                        // Diamond shape, matching Talent Editor's Class Tree grid: the
+                        // top/bottom row's non-center corner cells are decorative empty
+                        // spacers, UNLESS a talent has actually been placed there — in
+                        // which case it still renders (never silently hide real data).
+                        const centerCol = Math.floor(classCols / 2);
+                        const isCorner = (row === 0 || row === classRows - 1) && col !== centerCol;
+                        if (isCorner && !talent) return <div key={cellIdx} style={{ width: 40, height: 40 }} />;
+                        return renderTalentCell(talent, cellIdx);
+                      })}
+                    </div>
                   </div>
+                )}
+
+                {/* Main spec grid */}
+                <div style={{ display: 'grid', gridTemplateColumns: `repeat(${gridCols}, 1fr)`, gap: 4 }}>
+                  {Array.from({ length: gridRows * gridCols }).map((_, cellIdx) => {
+                    const row = Math.floor(cellIdx / gridCols);
+                    const col = cellIdx % gridCols;
+                    const talent = talentsList.find(
+                      (t: Talent) => t.row === row && (t.column - colOffset) === col && t.id !== masteryId
                     );
-                  })()}
+                    return renderTalentCell(talent, cellIdx);
+                  })}
                 </div>
+
+                {/* Step 4: Hero talent tree selection + preview */}
+                {hasHeroTrees && (
+                  <div>
+                    <label style={{ fontWeight: 'bold', color: bgSpec ? '#fff' : textColor, textShadow: bgSpec ? '2px 2px 4px rgba(0,0,0,0.8)' : 'none' }}>
+                      Select Hero Talent Tree:
+                    </label>
+                    <div style={{ display: 'flex', gap: 8, marginTop: 8, marginBottom: 12 }}>
+                      {[0, 1].map((heroIdx) => {
+                        const heroColor = heroIdx === 0 ? '#f778ba' : '#bc8cff';
+                        const isActive = selectedHeroIdx === heroIdx;
+                        return (
+                          <button
+                            key={heroIdx}
+                            onClick={() => setSelectedHeroIdx(heroIdx)}
+                            title={`Hero Tree ${heroIdx + 1}`}
+                            style={{
+                              width: 40,
+                              height: 40,
+                              padding: 0,
+                              background: isActive ? heroColor + '33' : 'rgba(255,255,255,0.1)',
+                              border: `2px solid ${isActive ? heroColor : heroColor + '55'}`,
+                              borderRadius: 6,
+                              cursor: 'pointer',
+                              overflow: 'hidden',
+                              boxShadow: isActive ? `0 0 10px ${heroColor}aa` : 'none',
+                              transition: 'all 0.2s ease',
+                            }}
+                          >
+                            <TalentIcon iconPath={getHeroIconPath(heroIdx)} size={36} />
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {selectedHeroIdx !== null ? (
+                      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${heroCols}, 1fr)`, gap: 4 }}>
+                        {Array.from({ length: heroRows * heroCols }).map((_, cellIdx) => {
+                          const row = Math.floor(cellIdx / heroCols);
+                          const col = cellIdx % heroCols;
+                          const talent = talentsList.find(
+                            (t: Talent) => (t.row - heroRowOffset) === row && (t.column - heroColOffset) === col
+                          );
+                          // Same diamond-shape convention as the Class Tree above.
+                          const centerCol = Math.floor(heroCols / 2);
+                          const isCorner = (row === 0 || row === heroRows - 1) && col !== centerCol;
+                          if (isCorner && !talent) return <div key={cellIdx} style={{ width: 40, height: 40 }} />;
+                          return renderTalentCell(talent, cellIdx);
+                        })}
+                      </div>
+                    ) : (
+                      <p style={{ fontSize: 12, opacity: 0.7, color: bgSpec ? '#fff' : textColor }}>
+                        Pick a hero talent tree to preview it.
+                      </p>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
-          );
-          })}
-        </div>
-      </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

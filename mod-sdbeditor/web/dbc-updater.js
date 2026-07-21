@@ -247,7 +247,7 @@ export function syncSpellIconDbcFromIcons(sourceDbcPath, iconDir, outputDbcPath,
         fs.mkdirSync(path.dirname(outputDbcPath), { recursive: true });
         fs.copyFileSync(sourceDbcPath, outputDbcPath);
       }
-      return { success: true, added: 0, total: recordCount, output: outputDbcPath || sourceDbcPath };
+      return { success: true, added: 0, total: recordCount, output: outputDbcPath || sourceDbcPath, addedEntries: [] };
     }
 
     missing.sort();
@@ -291,11 +291,14 @@ export function syncSpellIconDbcFromIcons(sourceDbcPath, iconDir, outputDbcPath,
     newBuffer.set(buffer.slice(recordsStart, recordsStart + recordCount * fieldSize), recordsDestStart);
 
     let nextId = maxId + 1;
+    const addedEntries = [];
     for (let i = 0; i < missing.length; i++) {
       const newRecordStart = recordsDestStart + (recordCount + i) * fieldSize;
       const recView = new DataView(newBuffer.buffer, newRecordStart, fieldSize);
-      recView.setUint32(0, nextId++, true);
+      const assignedId = nextId++;
+      recView.setUint32(0, assignedId, true);
       recView.setUint32(4, offsets[i], true);
+      addedEntries.push({ id: assignedId, name: missing[i] });
     }
 
     const stringBlockDest = recordsDestStart + newRecordsSize;
@@ -314,6 +317,7 @@ export function syncSpellIconDbcFromIcons(sourceDbcPath, iconDir, outputDbcPath,
       added: missing.length,
       total: newRecordCount,
       output: outputDbcPath,
+      addedEntries,
     };
   } catch (err) {
     return { success: false, error: err.message };

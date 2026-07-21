@@ -15,6 +15,8 @@ enum class BotRole : uint8
     ROLE_RANGED_DPS = 3,
     ROLE_MELEE_HEALER = 4,
     ROLE_RANGED_HEALER = 5,
+    ROLE_RANGED_DOT = 6, // sustained-DoT ranged caster (e.g. Affliction Warlock)
+    ROLE_MELEE_DOT  = 7, // sustained-bleed/DoT melee (e.g. Combat/Sub bleeds, Feral cat)
 };
 
 inline const char* BotRoleName(BotRole role)
@@ -27,6 +29,8 @@ inline const char* BotRoleName(BotRole role)
         case BotRole::ROLE_RANGED_DPS: return "Ranged DPS";
         case BotRole::ROLE_MELEE_HEALER: return "Melee Healer";
         case BotRole::ROLE_RANGED_HEALER: return "Ranged Healer";
+        case BotRole::ROLE_RANGED_DOT: return "Ranged DoT";
+        case BotRole::ROLE_MELEE_DOT:  return "Melee DoT";
         default:                       return "Unknown";
     }
 }

@@ -1,1 +1,5 @@
 AC_ADD_SCRIPT(src/mod_mage_expanded.cpp)
+AC_ADD_SCRIPT(src/combustion_mechanics.cpp)
+AC_ADD_SCRIPT(src/ignite_mastery.cpp)
+AC_ADD_SCRIPT(src/hot_streak_consumption.cpp)
+AC_ADD_SCRIPT(src/living_bomb_on_hotstreak.cpp)

@@ -52,6 +52,57 @@ type FileServiceStatus = {
   timestamp?: string;
 };
 
+type SyncWorkflowStage = {
+  name: string;
+  ok: boolean;
+  details?: any;
+};
+
+type SyncWorkflowReport = {
+  success: boolean;
+  durationMs?: number;
+  stages?: SyncWorkflowStage[];
+  error?: string;
+  active?: { dbc: string; icons: string };
+  exportPaths?: { dbcs: string; icons: string };
+};
+
+function summarizeSyncStageDetails(stage: SyncWorkflowStage): string | null {
+  const d = stage.details;
+  if (!d) return null;
+  switch (stage.name) {
+    case 'rebuild-indexes':
+      return `icons=${d.spellIconEntries ?? '?'} (${d.spellIconSource || 'unknown'}), names=${d.spellNameEntries ?? '?'}`;
+    case 'spell-icon-sync': {
+      const parts = [`added=${d.added ?? 0}`];
+      if (d.sqlUpsert?.upserted !== undefined) parts.push(`sqlSynced=${d.sqlUpsert.upserted}`);
+      if (d.sqlUpsert?.error) parts.push(`sqlError=${d.sqlUpsert.error}`);
+      return parts.join(', ');
+    }
+    case 'icon-quarantine': {
+      if (d.skipped) return d.error || 'skipped';
+      return `quarantined=${d.quarantinedCount ?? 0}, restored=${d.restoredCount ?? 0}, known=${d.knownIconCount ?? '?'}`;
+    }
+    default:
+      return null;
+  }
+}
+
+type DbcBackupEntry = {
+  name: string;
+  manual: boolean;
+  mtime: string;
+  mtimeMs?: number;
+  fileCount: number;
+};
+
+type DbcBackupStatus = {
+  success: boolean;
+  lastBackup: DbcBackupEntry | null;
+  count: number;
+  backups?: DbcBackupEntry[];
+};
+
 type Props = {
   token: string | null;
   baseUrl: string;
@@ -70,6 +121,12 @@ const ServerStarter: React.FC<Props> = ({ token, baseUrl, fileBaseUrl, textColor
   const [fileStatus, setFileStatus] = useState<FileServiceStatus | null>(null);
   const [fileStatusError, setFileStatusError] = useState<string | null>(null);
   const [fileStatusBusy, setFileStatusBusy] = useState(false);
+  const [syncWorkflowBusy, setSyncWorkflowBusy] = useState(false);
+  const [syncWorkflowError, setSyncWorkflowError] = useState<string | null>(null);
+  const [syncWorkflowReport, setSyncWorkflowReport] = useState<SyncWorkflowReport | null>(null);
+  const [dbcBackupStatus, setDbcBackupStatus] = useState<DbcBackupStatus | null>(null);
+  const [dbcBackupBusy, setDbcBackupBusy] = useState(false);
+  const [dbcBackupError, setDbcBackupError] = useState<string | null>(null);
 
   const parseJsonSafe = async (res: Response) => {
     const text = await res.text();
@@ -279,10 +336,69 @@ const ServerStarter: React.FC<Props> = ({ token, baseUrl, fileBaseUrl, textColor
     }
   };
 
+  const runSyncWorkflow = async () => {
+    try {
+      setSyncWorkflowBusy(true);
+      setSyncWorkflowError(null);
+      const res = await fetch(`${fileBaseUrl}/api/sync-workflow/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          autoRepairLocaleOffsets: true,
+          runSpellIconSync: true,
+          runIconQuarantine: true,
+        }),
+      });
+      const payload = await parseJsonSafe(res);
+      setSyncWorkflowReport(payload as SyncWorkflowReport);
+      if (!res.ok) {
+        setSyncWorkflowError(payload.error || 'Sync workflow failed');
+      }
+      await fetchFileStatus();
+    } catch (err) {
+      setSyncWorkflowError(err instanceof Error ? err.message : 'Sync workflow failed');
+    } finally {
+      setSyncWorkflowBusy(false);
+    }
+  };
+
+  const fetchDbcBackupStatus = async () => {
+    try {
+      const res = await fetch(`${fileBaseUrl}/api/dbc-backup/status`);
+      const payload = await parseJsonSafe(res);
+      if (!res.ok) {
+        setDbcBackupError(payload.error || 'Failed to fetch DBC backup status');
+        return;
+      }
+      setDbcBackupStatus(payload as DbcBackupStatus);
+    } catch (err) {
+      setDbcBackupError(err instanceof Error ? err.message : 'Failed to fetch DBC backup status');
+    }
+  };
+
+  const runDbcBackupNow = async () => {
+    try {
+      setDbcBackupBusy(true);
+      setDbcBackupError(null);
+      const res = await fetch(`${fileBaseUrl}/api/dbc-backup/run`, { method: 'POST' });
+      const payload = await parseJsonSafe(res);
+      if (!res.ok) {
+        setDbcBackupError(payload.error || 'DBC backup failed');
+        return;
+      }
+      await fetchDbcBackupStatus();
+    } catch (err) {
+      setDbcBackupError(err instanceof Error ? err.message : 'DBC backup failed');
+    } finally {
+      setDbcBackupBusy(false);
+    }
+  };
+
   useEffect(() => {
     fetchStatus();
     refreshTerminals();
     fetchFileStatus();
+    fetchDbcBackupStatus();
   }, [token, fileBaseUrl]);
 
   useEffect(() => {
@@ -446,7 +562,90 @@ const ServerStarter: React.FC<Props> = ({ token, baseUrl, fileBaseUrl, textColor
             {busy === 'npm-restart' ? 'Restarting...' : 'Restart NPM Dev Server'}
           </button>
         </div>
+
+        <div style={{ padding: 14, borderRadius: 8, background: contentBoxColor, border: '1px solid #e2e8f0' }}>
+          <h4 style={{ margin: 0, marginBottom: 8, color: textColor }}>DBC Sync + Validation</h4>
+          <button onClick={runSyncWorkflow} disabled={syncWorkflowBusy || busy !== null}>
+            {syncWorkflowBusy ? 'Running...' : 'Run Sync Workflow'}
+          </button>
+          <div style={{ marginTop: 8, fontSize: 12, color: '#64748b' }}>
+            Imports server DBCs, runs Spell.dbc locale preflight/repair, syncs SpellIcon export (new icons get a
+            sdbeditor.spellicon row automatically), quarantines any icon file with no matching
+            sdbeditor.spellicon entry into an "_unlisted" subfolder, then rebuilds the spell-icon index from SQL.
+          </div>
+        </div>
+
+        <div style={{ padding: 14, borderRadius: 8, background: contentBoxColor, border: '1px solid #e2e8f0' }}>
+          <h4 style={{ margin: 0, marginBottom: 8, color: textColor }}>DBC Backup</h4>
+          <button onClick={runDbcBackupNow} disabled={dbcBackupBusy || busy !== null}>
+            {dbcBackupBusy ? 'Backing up...' : 'Backup Now'}
+          </button>
+          <div style={{ marginTop: 8, fontSize: 12, color: '#64748b' }}>
+            {dbcBackupStatus?.lastBackup ? (
+              <>
+                Last backup: {new Date(dbcBackupStatus.lastBackup.mtime).toLocaleString()}
+                {' '}({dbcBackupStatus.lastBackup.fileCount} files{dbcBackupStatus.lastBackup.manual ? ', manual' : ', automatic'})
+                <br />
+                Total snapshots: {dbcBackupStatus.count}
+              </>
+            ) : (
+              'No backups yet.'
+            )}
+            {dbcBackupError && (
+              <div style={{ marginTop: 4, color: '#dc2626' }}>{dbcBackupError}</div>
+            )}
+          </div>
+        </div>
       </div>
+
+      {(syncWorkflowError || syncWorkflowReport) && (
+        <div
+          style={{
+            marginTop: 16,
+            border: '1px solid #e2e8f0',
+            borderRadius: 8,
+            padding: 12,
+            backgroundColor: contentBoxColor,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <strong style={{ color: textColor }}>Sync Workflow Report</strong>
+            {syncWorkflowReport && (
+              <span style={{ fontSize: 12, color: syncWorkflowReport.success ? '#166534' : '#991b1b' }}>
+                {syncWorkflowReport.success ? 'PASS' : 'FAIL'}
+              </span>
+            )}
+            {syncWorkflowReport?.durationMs !== undefined && (
+              <span style={{ fontSize: 12, color: '#64748b' }}>{syncWorkflowReport.durationMs}ms</span>
+            )}
+          </div>
+
+          {syncWorkflowError && (
+            <div style={{ marginTop: 8, fontSize: 12, color: '#b91c1c' }}>{syncWorkflowError}</div>
+          )}
+
+          {syncWorkflowReport?.stages?.length ? (
+            <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
+              {syncWorkflowReport.stages.map((stage, idx) => (
+                <div key={`${stage.name}-${idx}`} style={{ fontSize: 12 }}>
+                  <span style={{ color: stage.ok ? '#166534' : '#991b1b' }}>
+                    {stage.ok ? 'OK' : 'FAIL'} - {stage.name}
+                  </span>
+                  {summarizeSyncStageDetails(stage) && (
+                    <span style={{ color: '#64748b', marginLeft: 6 }}>{summarizeSyncStageDetails(stage)}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {syncWorkflowReport?.active && (
+            <div style={{ marginTop: 8, fontSize: 12, color: '#475569' }}>
+              Active paths: DBC={syncWorkflowReport.active.dbc}, Icons={syncWorkflowReport.active.icons}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ marginTop: 24 }}>
         <h4 style={{ margin: '0 0 8px 0' }}>File Service Status</h4>

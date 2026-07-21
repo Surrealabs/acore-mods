@@ -4,6 +4,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "GameTime.h"
+#include "Random.h"
 #include "Utilities/DataMap.h"
 
 #include <algorithm>
@@ -120,14 +121,50 @@ namespace
 		return candidates;
 	}
 
-	void ApplyTriggeredHeal(Player* healer, Unit* target, uint32 amount, SpellInfo const* sourceSpell)
+	void ApplyTriggeredHeal(Player* healer, Unit* target, uint32 amount, SpellInfo const* sourceSpell, bool allowCrit = false)
 	{
 		if (!healer || !target || amount == 0)
 			return;
 
+		// Optionally roll a crit using the healer's normal spell crit chance for this school,
+		// same as a real heal cast would, and scale the amount if it crits.
+		bool crit = false;
+		if (allowCrit && sourceSpell)
+		{
+			float critChance = healer->SpellDoneCritChance(target, sourceSpell, sourceSpell->GetSchoolMask(), BASE_ATTACK, true);
+			if (critChance > 0.0f && roll_chance_f(critChance))
+			{
+				crit = true;
+				amount = Unit::SpellCriticalHealingBonus(healer, sourceSpell, amount, target);
+			}
+		}
+
 		SpellSchoolMask schoolMask = sourceSpell ? sourceSpell->GetSchoolMask() : SPELL_SCHOOL_MASK_HOLY;
 		HealInfo healInfo(healer, target, amount, sourceSpell, schoolMask);
-		healer->HealBySpell(healInfo, false);
+		int32 gain = healer->HealBySpell(healInfo, crit);
+
+		// HealBySpell() only applies the heal - it does not raise the usual proc events a real
+		// spell cast would (Spell::EffectHeal does that separately). Without this, heal-triggered
+		// procs like Divine Aegis never see these synthetic heals (Beacon replication, damage
+		// funnel, Divine Storm burst heal).
+		uint32 procAttacker;
+		uint32 procVictim;
+		if (sourceSpell && sourceSpell->DmgClass == SPELL_DAMAGE_CLASS_MAGIC)
+		{
+			procAttacker = PROC_FLAG_DONE_SPELL_MAGIC_DMG_CLASS_POS;
+			procVictim = PROC_FLAG_TAKEN_SPELL_MAGIC_DMG_CLASS_POS;
+		}
+		else
+		{
+			procAttacker = PROC_FLAG_DONE_SPELL_NONE_DMG_CLASS_POS;
+			procVictim = PROC_FLAG_TAKEN_SPELL_NONE_DMG_CLASS_POS;
+		}
+
+		uint32 procEx = crit ? PROC_EX_CRITICAL_HIT : PROC_EX_NORMAL_HIT;
+		if (gain > 0)
+			procEx |= PROC_EX_NO_OVERHEAL;
+
+		Unit::ProcDamageAndSpell(healer, target, procAttacker, procVictim, procEx, amount, BASE_ATTACK, sourceSpell, nullptr, -1, nullptr, nullptr, &healInfo);
 	}
 
 	bool IsReplicationInProgress(Player* caster)
@@ -280,7 +317,7 @@ class PaladinExpandedBeaconUnitScript : public UnitScript
 			if (!target)
 				continue;
 
-			ApplyTriggeredHeal(caster, target, funnelHealPerTarget, beaconSpell);
+			ApplyTriggeredHeal(caster, target, funnelHealPerTarget, beaconSpell, true);
 		}
 		SetReplicationState(caster, false);
 
@@ -323,7 +360,7 @@ class PaladinExpandedBeaconUnitScript : public UnitScript
 			if (!duplicateTarget)
 				continue;
 
-			ApplyTriggeredHeal(caster, duplicateTarget, duplicatedHeal, spellInfo);
+			ApplyTriggeredHeal(caster, duplicateTarget, duplicatedHeal, spellInfo, true);
 		}
 		SetReplicationState(caster, false);
 	}

@@ -352,15 +352,20 @@ static void FinishBotSpawn(ObjectGuid masterGuid, WorldSession* botSession, Obje
     }
     group->AddMember(bot);
 
-    // ── Force Master Loot ──
+    // ── Loot: Free For All ──
     // Bots are socketless Player objects: they can never respond to a
-    // Need/Greed roll prompt, so the default GROUP_LOOT method leaves every
-    // drop hanging until the full roll timeout (60s) elapses before it can
-    // be assigned — making looting feel completely broken. Master Loot lets
-    // the human master hand items to bots directly (see .army equip/equipitem).
-    group->SetLootMethod(MASTER_LOOT);
-    group->SetLooterGuid(master->GetGUID());
-    group->SetMasterLooterGuid(master->GetGUID());
+    // Need/Greed roll prompt, so GROUP_LOOT/NEED_BEFORE_GREED would leave
+    // every drop hanging until the full roll timeout (60s) elapses. Master
+    // Loot avoids the roll but funnels every item through a manual "give"
+    // step, and worse: the loot recipient tracked per-kill is whoever
+    // landed the tap (see BotAI.cpp's tap fix), so if that step were ever
+    // skipped the master couldn't reach the loot at all. Free For All has
+    // no roll AND no middleman — any party member (i.e. the master, since
+    // bots never attempt to loot themselves) can loot any kill directly,
+    // whether the master or a bot got the tap. Gear still reaches bots via
+    // the normal trade window, or `.army equip <name>` for what's already
+    // in their bags.
+    group->SetLootMethod(FREE_FOR_ALL);
     group->SendUpdate();
 
     // ── Detect role and spec ──
@@ -382,6 +387,8 @@ static void FinishBotSpawn(ObjectGuid masterGuid, WorldSession* botSession, Obje
     else if (role == BotRole::ROLE_RANGED_DPS) roleName = "Ranged DPS";
     else if (role == BotRole::ROLE_MELEE_HEALER) roleName = "Melee Healer";
     else if (role == BotRole::ROLE_RANGED_HEALER) roleName = "Ranged Healer";
+    else if (role == BotRole::ROLE_RANGED_DOT) roleName = "Ranged DoT";
+    else if (role == BotRole::ROLE_MELEE_DOT) roleName = "Melee DoT";
 
     // Notify master
     ChatHandler(master->GetSession()).PSendSysMessage("|cff00ff00{} has joined your party as {}!|r", bot->GetName(), roleName);
@@ -651,9 +658,13 @@ public:
             newRole = BotRole::ROLE_MELEE_DPS;
         else if (roleArg == "rdps" || roleArg == "ranged")
             newRole = BotRole::ROLE_RANGED_DPS;
+        else if (roleArg == "rdot" || roleArg == "ranged_dot")
+            newRole = BotRole::ROLE_RANGED_DOT;
+        else if (roleArg == "mdot" || roleArg == "melee_dot")
+            newRole = BotRole::ROLE_MELEE_DOT;
         else
         {
-            handler->PSendSysMessage("|cffff0000Unknown role '{}'. Use: tank, heal, mheal, rheal, dps, rdps|r", roleArg);
+            handler->PSendSysMessage("|cffff0000Unknown role '{}'. Use: tank, heal, mheal, rheal, dps, rdps, rdot, mdot|r", roleArg);
             return true;
         }
 
@@ -666,14 +677,16 @@ public:
         else if (newRole == BotRole::ROLE_RANGED_HEALER) roleName = "Ranged Healer";
         else if (newRole == BotRole::ROLE_MELEE_DPS) roleName = "Melee DPS";
         else if (newRole == BotRole::ROLE_RANGED_DPS) roleName = "Ranged DPS";
+        else if (newRole == BotRole::ROLE_RANGED_DOT) roleName = "Ranged DoT";
+        else if (newRole == BotRole::ROLE_MELEE_DOT) roleName = "Melee DoT";
 
         handler->PSendSysMessage("|cff00ff00{} is now set to {}.|r", nameArg, roleName);
         return true;
     }
 
-    // .army loot — re-apply Master Loot to your current party (fixes groups
-    // that were formed before this feature existed, without needing to
-    // dismiss/respawn every bot).
+    // .army loot — re-apply Free For All loot to your current party (fixes
+    // groups that were formed before this feature existed, without needing
+    // to dismiss/respawn every bot).
     static bool HandleArmyLootCommand(ChatHandler* handler)
     {
         Player* master = handler->GetSession()->GetPlayer();
@@ -687,12 +700,10 @@ public:
             return true;
         }
 
-        group->SetLootMethod(MASTER_LOOT);
-        group->SetLooterGuid(master->GetGUID());
-        group->SetMasterLooterGuid(master->GetGUID());
+        group->SetLootMethod(FREE_FOR_ALL);
         group->SendUpdate();
 
-        handler->PSendSysMessage("|cff00ff00Master Loot enabled — you are now the loot master.|r");
+        handler->PSendSysMessage("|cff00ff00Free For All loot enabled — you can loot every kill directly, no rolls or master-loot step.|r");
         return true;
     }
 
@@ -728,7 +739,7 @@ public:
         handler->PSendSysMessage("|cff00ff00=== {} ({}) — range {} yd ===|r",
             rot->specName, BotRoleName(rot->role), rot->preferredRange);
 
-        auto showSlots = [&](const char* label, const std::array<uint32, SPELLS_PER_BUCKET>& arr)
+        auto showSlots = [&](const char* label, auto const& arr)
         {
             std::string line = std::string(label) + ":";
             for (uint32 id : arr)
@@ -738,13 +749,18 @@ public:
             }
             handler->PSendSysMessage("{}", line);
         };
+        auto showSlot = [&](const char* label, uint32 id)
+        {
+            handler->PSendSysMessage("{}: {}", label, id == 0 ? std::string("-") : std::to_string(id));
+        };
 
-        showSlots("Abilities",  rot->abilities);
-        showSlots("Buffs",      rot->buffs);
-        showSlots("Defensives", rot->defensives);
-        showSlots("DoTs",       rot->dots);
-        showSlots("HoTs",       rot->hots);
-        showSlots("Mobility",   rot->mobility);
+        showSlot ("Filler",          rot->filler);
+        showSlots("Rotation",        rot->rotation);
+        showSlot ("Interrupt",       rot->interrupt);
+        showSlot ("Mobility",        rot->mobility);
+        showSlots("Defensives",      rot->defensives);
+        showSlot ("Damage Cooldown", rot->damageCooldown);
+        showSlot ("Party Buff",      rot->partyBuff);
 
         return true;
     }

@@ -13,6 +13,7 @@
 #include "SpellInfo.h"
 #include "SpellAuras.h"
 #include "SpellAuraEffects.h"
+#include "Utilities/Timer.h"
 #include <cmath>
 
 namespace
@@ -25,6 +26,9 @@ namespace
     constexpr int32 TANK_PASSIVE_PARRY_CAP_RATING = TANK_PASSIVE_PARRY_CAP_PERCENT * TANK_PASSIVE_RATING_PER_PERCENT;
     constexpr int32 TANK_PASSIVE_DODGE_CAP_RATING = TANK_PASSIVE_DODGE_CAP_PERCENT * TANK_PASSIVE_RATING_PER_PERCENT;
     constexpr float HASTE_CRIT_BASELINE_RATING_PER_PERCENT = 10.0f;
+
+    // Every this many points of Intellect grants 1 MP5. Tune here.
+    constexpr int32 INTELLECT_PER_MP5 = 5;
 
     int32 GetScaledRatingFromDb(Player* player, const char* statName, int32 rawRating)
     {
@@ -111,6 +115,15 @@ static void UpdateDerivedStats(Player* player)
             int32 v = (int32)static_cast<FloatData*>(oldSpHealData)->value;
             if (v > 0)
                 player->ApplySpellHealingBonus(v, false);
+        }
+
+        // INT -> MP5 (remove old)
+        DataMap::Base* oldMp5Data = player->CustomData.GetDefault<DataMap::Base>("Mp5_Applied");
+        if (oldMp5Data)
+        {
+            int32 v = (int32)static_cast<FloatData*>(oldMp5Data)->value;
+            if (v > 0)
+                player->ApplyManaRegenBonus(v, false);
         }
 
         // -------------------------------------------------------
@@ -307,6 +320,7 @@ static void UpdateDerivedStats(Player* player)
         //    1 INT = 2 Spell Damage
         //    1 SPI = 2 Spell Healing
         //    1 STA = 10 HP (already native)
+        //    INTELLECT_PER_MP5 Intellect = 1 MP5
         // -------------------------------------------------------
 
         int32 intellect = (int32)player->GetStat(STAT_INTELLECT);
@@ -321,6 +335,11 @@ static void UpdateDerivedStats(Player* player)
         int32 bonusSpHeal = spirit * 2;
         player->ApplySpellHealingBonus(bonusSpHeal, true);
         player->CustomData.Set("SpellHeal_Applied", new FloatData((float)bonusSpHeal));
+
+        // INT -> MP5 (every INTELLECT_PER_MP5 Intellect grants 1 MP5)
+        int32 bonusMp5 = intellect / INTELLECT_PER_MP5;
+        player->ApplyManaRegenBonus(bonusMp5, true);
+        player->CustomData.Set("Mp5_Applied", new FloatData((float)bonusMp5));
 
         player->CustomData.Erase("StatsExpanded_RecalcGuard");
 
@@ -480,12 +499,44 @@ public:
         if (spellInfo->IsPositive())
             return;
 
-        // Prevent recursive multistrike
+        // Prevent recursive multistrike (from the duplicate cast fired below)
         if (BoolData* flag = player->CustomData.Get<BoolData>("Multistrike_InProgress"))
         {
             if (flag->value)
                 return;
         }
+
+        // AoE spells (e.g. Chain Lightning-style volleys) call this hook once
+        // PER TARGET hit by the same cast. Without this guard, each target got
+        // its own independent multistrike roll, and every success re-cast the
+        // whole AoE spell again - causing runaway "multistrike chains" that
+        // looked like the spell was recasting itself far more often than
+        // intended. Only allow one roll per originating cast.
+        //
+        // NOTE: an earlier version of this guard used
+        // attacker->GetCurrentSpell(...) and dereferenced the returned Spell*
+        // for identity comparison. That is NOT safe here: Unit::m_currentSpells
+        // is reentrant/mutable, and the duplicate cast fired a few lines below
+        // (CastCustomSpell) overwrites that same slot while we're still mid-loop
+        // over the original AoE cast's targets. By the time later targets in
+        // the same cast reach this hook, the pointer can refer to a Spell
+        // object that's already being destroyed - a use-after-free that
+        // crashed the server intermittently on AoE spells (Frost Bolt Volley,
+        // Tremor). Use a short wall-clock window instead - all targets of one
+        // instantaneous AoE cast are processed within the same server tick, so
+        // gating on (spellId + elapsed time) is enough to dedupe them without
+        // ever touching a Spell object's lifetime.
+        constexpr uint32 SAME_CAST_WINDOW_MS = 100;
+        uint32 now = getMSTime();
+
+        UInt32Data* lastSpellId = player->CustomData.GetDefault<UInt32Data>("Multistrike_LastProcSpellId");
+        UInt32Data* lastProcTime = player->CustomData.GetDefault<UInt32Data>("Multistrike_LastProcTime");
+
+        if (lastSpellId->value == spellInfo->Id && getMSTimeDiff(lastProcTime->value, now) < SAME_CAST_WINDOW_MS)
+            return; // already rolled/processed multistrike for this cast
+
+        lastSpellId->value = spellInfo->Id;
+        lastProcTime->value = now;
 
         if (!Multistrike::RollMultistrike(player))
             return;

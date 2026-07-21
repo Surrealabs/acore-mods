@@ -7,12 +7,14 @@ import fileUpload from 'express-fileupload';
 import cors from 'cors';
 import compression from 'compression';
 import sharp from 'sharp';
+import { spawnSync } from 'child_process';
 import { BLPFile } from './src/lib/blpconverter.js';
 import { generateIconManifest, saveManifest, updateFullManifest, loadOrBuildIconList, saveIconList } from './manifest-generator.js';
 import { addIconToSpellIconDbc, initializeSpellIconDbc, syncSpellIconDbcFromIcons } from './dbc-updater.js';
 import { generateSpriteSheets } from './sprite-generator.js';
 import genericDbcRouter from './generic-dbc-router.js';
 import { readDBC, writeDBC } from './generic-dbc-parser.js';
+import { definitions as DBC_DEFINITIONS } from './dbc-definitions.js';
 
 // Error logging setup
 const ERROR_LOG_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public', 'error-logs');
@@ -75,6 +77,7 @@ const CORE_SPELL_DEFINES_PATH = path.join(__dirname, '..', '..', '..', 'src', 's
 const WORLD_SPELL_SCRIPT_NAMES_SQL_PATH = path.join(__dirname, '..', '..', '..', 'data', 'sql', 'base', 'db_world', 'spell_script_names.sql');
 const CONFIG_PATH = path.join(PUBLIC_DIR, 'config.json');
 const ICON_LIST_PATH = path.join(PUBLIC_DIR, 'icon-list.json');
+const SPELL_DBC_FIXER_PATH = '/root/tools/fix_spell_dbc_locale_offsets.py';
 
 const DEFAULT_CONFIG = {
   paths: {
@@ -927,6 +930,11 @@ const SPELL_REF_FIELD_CONFIG = {
   SpellVisual1: { table: 'spellvisual', labelExpr: 'CONCAT(\'Visual \', ID)' },
   SpellVisual2: { table: 'spellvisual', labelExpr: 'CONCAT(\'Visual \', ID)' },
   SpellMissileID: { table: 'spellmissile', labelExpr: 'CONCAT(\'Missile \', ID)' },
+  VisualKit: { table: 'spellvisualkit', labelExpr: 'CONCAT(\'Kit \', ID)' },
+  VisualEffectName: { table: 'spellvisualeffectname', labelExpr: 'COALESCE(NULLIF(Name,\'\'), CONCAT(\'Effect \', ID))' },
+  MissilePreset: { table: 'spellmissile', labelExpr: 'CONCAT(\'Missile \', ID)' },
+  MissileMotionPreset: { table: 'spellmissilemotion', labelExpr: 'COALESCE(NULLIF(name,\'\'), CONCAT(\'Motion \', ID))' },
+  AreaModel: { table: 'spellvisualkitareamodel', labelExpr: 'COALESCE(NULLIF(Name,\'\'), CONCAT(\'Area \', ID))' },
 };
 
 function toSafeReferenceLimit(rawValue, fallback = 40) {
@@ -1637,9 +1645,9 @@ app.get('/api/debug/talent-trees', (req, res) => {
 // Endpoint to get talent tab names from TalentTab.dbc (with caching)
 app.get('/api/talent-tab-names', (req, res) => {
   try {
-    if (fs.existsSync(TALENT_CONFIG_PATH)) {
+    const cfg = loadDeployedTalentConfig();
+    if (cfg) {
       try {
-        const cfg = JSON.parse(fs.readFileSync(TALENT_CONFIG_PATH, 'utf8'));
         const classes = cfg?.classes || {};
         const tabNamesFromJson = {};
 
@@ -1725,9 +1733,9 @@ app.get('/api/talents/:className', (req, res) => {
       });
     }
 
-    if (fs.existsSync(TALENT_CONFIG_PATH)) {
+    const cfg = loadDeployedTalentConfig();
+    if (cfg) {
       try {
-        const cfg = JSON.parse(fs.readFileSync(TALENT_CONFIG_PATH, 'utf8'));
         const classCfg = cfg?.classes?.[classId] || cfg?.classes?.[String(classId)];
         const specsCfg = Array.isArray(classCfg?.specs) ? classCfg.specs : null;
         const tabsCfg = classCfg && classCfg.tabs && typeof classCfg.tabs === 'object' ? classCfg.tabs : null;
@@ -1853,6 +1861,7 @@ app.get('/api/talents/:className', (req, res) => {
                   spellId,
                   spellRanks: spells,
                   maxRank: Number(t?.maxRank || spells.length || 1),
+                  mastery: !!t?.mastery,
                   prereqTalents: prereqs.map((p) => Number(p?.id || 0)),
                   prereqRanks: prereqs.map((p) => Number(p?.rank || 0)),
                   iconPath,
@@ -1862,9 +1871,35 @@ app.get('/api/talents/:className', (req, res) => {
               .filter((t) => t.id > 0)
               .sort((a, b) => a.row - b.row || a.column - b.column);
 
+            const specName = (spec && typeof spec.name === 'string' && spec.name.trim())
+              || (tab && typeof tab.name === 'string' && tab.name.trim())
+              || `Spec ${tabIdx}`;
+            const specRows = Math.max(1, Number(spec?.rows || SPEC_DEFAULT_ROWS));
+            const heroCols = SIDE_TREE_COLS;
+
             return {
               tabId,
+              name: specName,
+              rows: specRows,
+              cols: specCols,
               talents,
+              // Zone layout describing the shared combined-column coordinate space
+              // (matches Talent Editor's class-tree/spec-tree/hero-tree flattening),
+              // so consumers don't have to hardcode a fixed 4-col/11-row grid.
+              layout: {
+                classCols: SIDE_TREE_COLS,
+                specColStart: SPEC_COL_START,
+                specCols,
+                heroColStart,
+                heroCols,
+                mainRows: specRows,
+                hero1RowStart: 0,
+                hero1Rows: SIDE_TREE_ROWS,
+                hero2RowStart: HERO2_ROW_START,
+                hero2Rows: SIDE_TREE_ROWS,
+                totalCols: heroColStart + heroCols,
+                totalRows: Math.max(specRows, HERO2_ROW_START + SIDE_TREE_ROWS),
+              },
             };
           }).slice(0, MAX_CLASS_SPECS);
 
@@ -2340,7 +2375,22 @@ const CLASS_ID_TO_TOKEN = {
 // ═══════════════════════════════════════════════════════════════════════
 
 const TALENT_CONFIG_PATH = path.join(__dirname, 'talent-config.json');
+// Snapshot of talent-config.json taken at the moment "Deploy to Server" is
+// last clicked (POST /api/talent-config/deploy writes this). Spec Builder
+// reads THIS file (see loadDeployedTalentConfig()) instead of the live config
+// so its layout only changes when the author explicitly deploys, not on every
+// live edit/autosave in Talent Editor. Talent Editor itself still reads/writes
+// TALENT_CONFIG_PATH directly (unaffected — edits show up there immediately).
+const TALENT_DEPLOYED_PATH = path.join(__dirname, 'talent-config.deployed.json');
 const TALENT_WIPE_PATH = path.join(LUA_SCRIPTS_DIR, 'SurrealTalentWipe.lua');
+
+// Falls back to the live config only if nothing has ever been deployed yet
+// (first-run bootstrap) so Spec Builder isn't just empty before the first deploy.
+function loadDeployedTalentConfig() {
+  const sourcePath = fs.existsSync(TALENT_DEPLOYED_PATH) ? TALENT_DEPLOYED_PATH : TALENT_CONFIG_PATH;
+  if (!fs.existsSync(sourcePath)) return null;
+  return JSON.parse(fs.readFileSync(sourcePath, 'utf8'));
+}
 
 const CLASS_ID_MAP = {
   1: 'WARRIOR', 2: 'PALADIN', 3: 'HUNTER', 4: 'ROGUE',
@@ -2676,6 +2726,12 @@ app.post('/api/talent-config/deploy', (req, res) => {
     }
 
     const configData = JSON.parse(fs.readFileSync(TALENT_CONFIG_PATH, 'utf-8'));
+
+    // Snapshot the exact config that's live right now — this is what Spec
+    // Builder will read from this point on (see loadDeployedTalentConfig()),
+    // so its layout freezes to this snapshot until the next deploy.
+    fs.writeFileSync(TALENT_DEPLOYED_PATH, JSON.stringify(configData, null, 2));
+
     const normalized = normalizeTalentConfig(configData);
     const classes = normalized.classes || {};
 
@@ -3019,6 +3075,140 @@ app.get('/api/spell-search', async (req, res) => {
   }
 });
 
+// Paginated, ID-ordered full spell list for the Spell Editor's left-hand
+// browser panel — unlike /api/spell-search (name/id search only, no icons,
+// requires 2+ chars), this always returns a page of spells in ascending ID
+// order (optionally filtered) with icon names resolved from the spell-icon
+// index so thumbnails render in the list.
+app.get('/api/spell-list', async (req, res) => {
+  try {
+    const schema = await loadCustomSpellSchema();
+    if (!schema) return res.status(503).json({ error: 'Custom spell database unavailable' });
+
+    const nameColumn =
+      schema.normalizedToActual.spellname0 ||
+      schema.normalizedToActual.spellname ||
+      schema.normalizedToActual.name ||
+      null;
+
+    const q = String(req.query.q || '').trim();
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 100, 500));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    const selectName = nameColumn ? `\`${nameColumn}\` AS SpellName` : `NULL AS SpellName`;
+    let whereClause = '';
+    let params = [];
+    if (q) {
+      if (nameColumn) {
+        whereClause = `WHERE CAST(\`ID\` AS CHAR) LIKE ? OR \`${nameColumn}\` LIKE ?`;
+        params = [`%${q}%`, `%${q}%`];
+      } else {
+        whereClause = `WHERE CAST(\`ID\` AS CHAR) LIKE ?`;
+        params = [`%${q}%`];
+      }
+    }
+
+    const { rows, total } = await withCustomSpellConnection(async (conn) => {
+      const [countRows] = await conn.query(
+        `SELECT COUNT(*) AS total FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` ${whereClause}`,
+        params
+      );
+      const total = Number(countRows?.[0]?.total || 0);
+
+      const [rows] = await conn.query(
+        `SELECT \`ID\`, ${selectName} FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` ${whereClause} ORDER BY \`ID\` ASC LIMIT ? OFFSET ?`,
+        [...params, limit, offset]
+      );
+      return { rows: rows || [], total };
+    });
+
+    if (!dbcCache.spellIconIndex) {
+      try { loadOrBuildSpellIconIndex(); } catch (e) { /* ignore */ }
+    }
+    const spellIconIndex = dbcCache.spellIconIndex || {};
+
+    const spells = rows.map((row) => {
+      const id = Number(row.ID || 0);
+      const name = String(row.SpellName || `Spell ${id}`).trim() || `Spell ${id}`;
+      const icon = spellIconIndex[id] ?? spellIconIndex[String(id)] ?? null;
+      return { id, name, icon };
+    });
+
+    res.json({ total, offset, limit, spells });
+  } catch (error) {
+    console.error('Error listing spells from SQL:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Given a spell ID (and optional q filter matching /api/spell-list's WHERE
+// clause), return that spell's zero-based position in the ID-ascending list.
+// Lets the Spell Editor's infinite-scroll list jump straight to a looked-up
+// spell's location (e.g. the custom 900000+ range) without paging through
+// everything before it.
+app.get('/api/spell-list-offset', async (req, res) => {
+  try {
+    const schema = await loadCustomSpellSchema();
+    if (!schema) return res.status(503).json({ error: 'Custom spell database unavailable' });
+
+    const nameColumn =
+      schema.normalizedToActual.spellname0 ||
+      schema.normalizedToActual.spellname ||
+      schema.normalizedToActual.name ||
+      null;
+
+    const id = Number(req.query.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'id is required' });
+
+    const q = String(req.query.q || '').trim();
+    let whereParts = [`\`ID\` < ?`];
+    let params = [id];
+    if (q) {
+      if (nameColumn) {
+        whereParts.push(`(CAST(\`ID\` AS CHAR) LIKE ? OR \`${nameColumn}\` LIKE ?)`);
+        params.push(`%${q}%`, `%${q}%`);
+      } else {
+        whereParts.push(`CAST(\`ID\` AS CHAR) LIKE ?`);
+        params.push(`%${q}%`);
+      }
+    }
+    const whereClause = `WHERE ${whereParts.join(' AND ')}`;
+
+    const existsWhereParts = [`\`ID\` = ?`];
+    const existsParams = [id];
+    if (q) {
+      if (nameColumn) {
+        existsWhereParts.push(`(CAST(\`ID\` AS CHAR) LIKE ? OR \`${nameColumn}\` LIKE ?)`);
+        existsParams.push(`%${q}%`, `%${q}%`);
+      } else {
+        existsWhereParts.push(`CAST(\`ID\` AS CHAR) LIKE ?`);
+        existsParams.push(`%${q}%`);
+      }
+    }
+
+    const { offset, exists } = await withCustomSpellConnection(async (conn) => {
+      const [existsRows] = await conn.query(
+        `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` WHERE ${existsWhereParts.join(' AND ')}`,
+        existsParams
+      );
+      const exists = Number(existsRows?.[0]?.c || 0) > 0;
+
+      const [offsetRows] = await conn.query(
+        `SELECT COUNT(*) AS offset FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` ${whereClause}`,
+        params
+      );
+      const offset = Number(offsetRows?.[0]?.offset || 0);
+      return { offset, exists };
+    });
+
+    if (!exists) return res.status(404).json({ error: `Spell ${id} not found` });
+    res.json({ id, offset });
+  } catch (error) {
+    console.error('Error resolving spell list offset:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/spell-enums', (req, res) => {
   try {
     const payload = getSpellEnumPayload();
@@ -3179,6 +3369,394 @@ app.get('/api/spells/export', (req, res) => {
   } catch (error) {
     console.error('Error exporting Spell.dbc:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ── SQL -> DBC export pipeline for the visual/missile companion DBCs ─────
+// These 8 tables are the "everything else" Stoneharry's tool regenerates
+// alongside Spell.dbc on export. Unlike Spell.dbc (234 fields, only
+// partially named - a full readDBC/writeDBC round trip is unsafe per the
+// modify-client-spell-visuals skill), these are simple, fully-numeric (or
+// tiny-string) schemas that are safe to fully regenerate from SQL.
+const VISUAL_CHAIN_DBC_TABLES = [
+  { dbc: 'SpellVisual', table: 'spellvisual' },
+  { dbc: 'SpellVisualKit', table: 'spellvisualkit' },
+  { dbc: 'SpellVisualEffectName', table: 'spellvisualeffectname' },
+  { dbc: 'SpellMissile', table: 'spellmissile' },
+  { dbc: 'SpellMissileMotion', table: 'spellmissilemotion' },
+  { dbc: 'SpellVisualKitAreaModel', table: 'spellvisualkitareamodel' },
+  { dbc: 'SpellVisualKitModelAttach', table: 'spellvisualkitmodelattach' },
+  { dbc: 'SpellVisualPrecastTransitions', table: 'spellvisualprecasttransitions' },
+];
+
+// Normalize a SQL numeric value into the signed 32-bit range expected by
+// writeDBC()'s 'int32' writer. sdbeditor stores several int32 DBC fields in
+// UNSIGNED SQL columns, so a "-1" sentinel shows up as 4294967295 - passing
+// that straight to Buffer.writeInt32LE throws a RangeError. This handles
+// both representations (already-signed OR unsigned-wrapped) safely.
+function toSigned32(value) {
+  let n = Math.trunc(Number(value));
+  if (!Number.isFinite(n)) return 0;
+  n = ((n % 4294967296) + 4294967296) % 4294967296; // normalize into [0, 2^32)
+  if (n > 2147483647) n -= 4294967296;
+  return n;
+}
+
+function backupDbcOnce(filePath, tag) {
+  const backupPath = `${filePath}.bak-${tag}`;
+  if (fs.existsSync(filePath) && !fs.existsSync(backupPath)) {
+    fs.copyFileSync(filePath, backupPath);
+  }
+}
+
+// Regenerate one visual/missile DBC file directly from its sdbeditor SQL
+// table, writing to the live server data/dbc/ path AND the client export
+// staging folder (export/DBFilesClient/), per this fork's established
+// "edit -> data/dbc + DBFilesClient" workflow.
+async function exportOneVisualChainDbc({ dbc, table }) {
+  const def = DBC_DEFINITIONS[dbc];
+  if (!def) throw new Error(`No dbc-definitions.js schema for ${dbc}`);
+  const fieldDefs = def.fields;
+  const cols = fieldDefs.map((f) => f.name);
+
+  const rows = await withCustomSpellConnection(async (conn) => {
+    const [result] = await conn.query(
+      `SELECT ${cols.map((c) => `\`${c}\``).join(', ')} FROM \`${CUSTOM_SPELL_DB}\`.\`${table}\` ORDER BY \`ID\` ASC`
+    );
+    return result;
+  });
+  if (!rows) throw new Error(`Could not query ${CUSTOM_SPELL_DB}.${table} (DB connection unavailable)`);
+
+  const records = rows.map((row) => fieldDefs.map((f) => {
+    const raw = row[f.name];
+    switch (f.type) {
+      case 'float': return Number(raw) || 0;
+      case 'int32': return toSigned32(raw);
+      case 'string': return raw == null ? '' : String(raw);
+      default: return Math.trunc(Number(raw)) >>> 0; // uint32 / flags
+    }
+  }));
+
+  const liveDbcPath = path.join(SERVER_DBC_DIR, `${dbc}.dbc`);
+  backupDbcOnce(liveDbcPath, 'pre-sql-export');
+  writeDBC(liveDbcPath, { fieldDefs, records });
+
+  const exportDbcDir = path.join(EXPORT_DIR, 'DBFilesClient');
+  if (!fs.existsSync(exportDbcDir)) fs.mkdirSync(exportDbcDir, { recursive: true });
+  fs.copyFileSync(liveDbcPath, path.join(exportDbcDir, `${dbc}.dbc`));
+
+  return { dbc, table, recordCount: records.length };
+}
+
+async function exportAllVisualChainDbcs() {
+  const results = [];
+  for (const entry of VISUAL_CHAIN_DBC_TABLES) {
+    results.push(await exportOneVisualChainDbc(entry));
+  }
+  return results;
+}
+
+// Regenerate ALL 8 visual/missile companion DBCs from sdbeditor SQL, then
+// write both to data/dbc/ (live server path) and export/DBFilesClient/
+// (client staging path). This is the "export spells also exports the
+// visual chain" step matching Stoneharry's tool.
+app.post('/api/spells/export-visual-dbcs', async (req, res) => {
+  try {
+    const results = await exportAllVisualChainDbcs();
+    res.json({ success: true, exported: results });
+  } catch (error) {
+    console.error('Error exporting visual/missile DBCs:', error);
+    logErrorToFile(`Error exporting visual/missile DBCs: ${error.stack || error}`);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ── Visual-chain aggregation + clone-safe editing ─────────────────────────
+// Backs the SpellEditor "Visual" tab's 5 sub-tabs (Base / Missile Model /
+// Kits and Effects / Motion / Map Builder). Resolves the full
+// Spell -> SpellVisual -> SpellVisualKit -> SpellVisualEffectName (+
+// SpellMissile / SpellMissileMotion / SpellVisualKitModelAttach) chain for
+// one spell in a single request.
+const VISUAL_KIT_FIELD_NAMES = ['PrecastKit', 'CastKit', 'ImpactKit', 'StateKit', 'StateDoneKit', 'ChannelKit', 'CasterImpactKit', 'TargetImpactKit'];
+const KIT_EFFECT_FIELD_NAMES = ['HeadEffect', 'ChestEffect', 'BaseEffect', 'LeftHandEffect', 'RightHandEffect', 'BreathEffect', 'LeftWeaponEffect', 'RightWeaponEffect', 'SpecialEffect1', 'SpecialEffect2', 'SpecialEffect3', 'WorldEffect'];
+
+app.get('/api/spells/:spellId(\\d+)/visual-chain', async (req, res) => {
+  try {
+    const spellId = parseInt(req.params.spellId, 10);
+    if (!Number.isFinite(spellId) || spellId <= 0) {
+      return res.status(400).json({ error: 'Invalid spell ID' });
+    }
+
+    const bundle = await withCustomSpellConnection(async (conn) => {
+      const [[spellRow]] = await conn.query(
+        `SELECT ID, SpellVisual1, SpellVisual2, SpellMissileID FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` WHERE ID=? LIMIT 1`,
+        [spellId]
+      );
+      if (!spellRow) return null;
+
+      const visual1Id = Number(spellRow.SpellVisual1 || 0);
+      const missileId = Number(spellRow.SpellMissileID || 0);
+
+      let visual = null;
+      const kits = {};
+      const effects = {};
+      const modelAttach = {};
+      let missileMotion = null;
+
+      if (visual1Id > 0) {
+        const [[visualRow]] = await conn.query(
+          `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisual\` WHERE ID=? LIMIT 1`,
+          [visual1Id]
+        );
+        if (visualRow) {
+          const [[cnt]] = await conn.query(
+            `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` WHERE SpellVisual1=? OR SpellVisual2=?`,
+            [visual1Id, visual1Id]
+          );
+          visual = { id: visual1Id, row: visualRow, sharedCount: Number(cnt.c || 0) };
+
+          const kitIds = [...new Set(VISUAL_KIT_FIELD_NAMES.map((f) => Number(visualRow[f] || 0)).filter((v) => v > 0))];
+          if (kitIds.length) {
+            const [kitRows] = await conn.query(
+              `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisualkit\` WHERE ID IN (${kitIds.map(() => '?').join(',')})`,
+              kitIds
+            );
+            for (const kitRow of kitRows || []) {
+              const kitId = Number(kitRow.ID);
+              const [[kcnt]] = await conn.query(
+                `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisual\` WHERE ${VISUAL_KIT_FIELD_NAMES.map((f) => `\`${f}\`=?`).join(' OR ')}`,
+                VISUAL_KIT_FIELD_NAMES.map(() => kitId)
+              );
+              kits[kitId] = { id: kitId, row: kitRow, sharedCount: Number(kcnt.c || 0) };
+            }
+
+            const [attachRows] = await conn.query(
+              `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisualkitmodelattach\` WHERE ParentSpellVisualKitId IN (${kitIds.map(() => '?').join(',')}) ORDER BY ID ASC`,
+              kitIds
+            );
+            for (const attachRow of attachRows || []) {
+              const pid = Number(attachRow.ParentSpellVisualKitId);
+              if (!modelAttach[pid]) modelAttach[pid] = [];
+              modelAttach[pid].push(attachRow);
+            }
+          }
+
+          // Collect effect ids referenced by every fetched kit, plus the
+          // visual's own missile model effect.
+          const effectIdSet = new Set();
+          for (const kitId of Object.keys(kits)) {
+            const kitRow = kits[kitId].row;
+            for (const f of KIT_EFFECT_FIELD_NAMES) {
+              const v = Number(kitRow[f] || 0);
+              if (v > 0) effectIdSet.add(v);
+            }
+          }
+          const missileModelId = Number(visualRow.MissileModel || 0);
+          if (missileModelId > 0) effectIdSet.add(missileModelId);
+
+          if (effectIdSet.size) {
+            const effectIds = [...effectIdSet];
+            const [effectRows] = await conn.query(
+              `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisualeffectname\` WHERE ID IN (${effectIds.map(() => '?').join(',')})`,
+              effectIds
+            );
+            for (const effectRow of effectRows || []) {
+              effects[Number(effectRow.ID)] = effectRow;
+            }
+          }
+
+          const motionId = Number(visualRow.MissileMotion || 0);
+          if (motionId > 0) {
+            const [[motionRow]] = await conn.query(
+              `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellmissilemotion\` WHERE ID=? LIMIT 1`,
+              [motionId]
+            );
+            if (motionRow) {
+              const [[mcnt]] = await conn.query(
+                `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisual\` WHERE MissileMotion=?`,
+                [motionId]
+              );
+              missileMotion = { id: motionId, row: motionRow, sharedCount: Number(mcnt.c || 0) };
+            }
+          }
+        }
+      }
+
+      let missile = null;
+      if (missileId > 0) {
+        const [[missileRow]] = await conn.query(
+          `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellmissile\` WHERE ID=? LIMIT 1`,
+          [missileId]
+        );
+        if (missileRow) {
+          const [[mcnt]] = await conn.query(
+            `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` WHERE SpellMissileID=?`,
+            [missileId]
+          );
+          missile = { id: missileId, row: missileRow, sharedCount: Number(mcnt.c || 0) };
+        }
+      }
+
+      const [areaModelRows] = await conn.query(
+        `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisualkitareamodel\` ORDER BY ID ASC`
+      );
+
+      return {
+        spellId,
+        spellVisual1: visual1Id,
+        spellVisual2: Number(spellRow.SpellVisual2 || 0),
+        spellMissileId: missileId,
+        visual,
+        kits,
+        effects,
+        modelAttach,
+        missile,
+        missileMotion,
+        areaModels: areaModelRows || [],
+      };
+    });
+
+    if (!bundle) return res.status(404).json({ error: 'Spell not found' });
+    res.json(bundle);
+  } catch (error) {
+    console.error('Error building visual chain:', error);
+    logErrorToFile(`Error building visual chain: ${error.stack || error}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reference-count lookups, keyed by table, used by the clone-safe editor
+// below to decide whether an edit can happen in place or must clone first.
+const CHAIN_REF_COUNT_QUERIES = {
+  spellvisual: (id) => ({
+    sql: `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` WHERE SpellVisual1=? OR SpellVisual2=?`,
+    params: [id, id],
+  }),
+  spellvisualkit: (id) => ({
+    sql: `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisual\` WHERE ${VISUAL_KIT_FIELD_NAMES.map((f) => `\`${f}\`=?`).join(' OR ')}`,
+    params: VISUAL_KIT_FIELD_NAMES.map(() => id),
+  }),
+  spellvisualeffectname: (id) => ({
+    sql: `SELECT (
+        (SELECT COUNT(*) FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisualkit\` WHERE ${KIT_EFFECT_FIELD_NAMES.map((f) => `\`${f}\`=?`).join(' OR ')})
+        +
+        (SELECT COUNT(*) FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisual\` WHERE MissileModel=?)
+      ) AS c`,
+    params: [...KIT_EFFECT_FIELD_NAMES.map(() => id), id],
+  }),
+  spellmissile: (id) => ({
+    sql: `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` WHERE SpellMissileID=?`,
+    params: [id],
+  }),
+  spellmissilemotion: (id) => ({
+    sql: `SELECT COUNT(*) AS c FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisual\` WHERE MissileMotion=?`,
+    params: [id],
+  }),
+};
+
+async function countChainReferences(table, id) {
+  const builder = CHAIN_REF_COUNT_QUERIES[table];
+  if (!builder) return 0;
+  const { sql, params } = builder(id);
+  const row = await withCustomSpellConnection(async (conn) => {
+    const [[r]] = await conn.query(sql, params);
+    return r;
+  });
+  return Number(row?.c || 0);
+}
+
+const CHAIN_EDITABLE_TABLES = new Set(['spellvisual', 'spellvisualkit', 'spellvisualeffectname', 'spellmissile', 'spellmissilemotion']);
+
+// Generic clone-safe editor for the 5 "chain" tables that real Blizzard
+// content commonly shares across many spells. Per the
+// modify-client-spell-visuals skill's CRITICAL SAFETY RULE: if the target
+// row is referenced by more than this one spell, it is cloned into a new
+// custom (900000+) ID instead of being edited in place, and the caller's
+// `ownerRepoint` is updated to point at the clone.
+app.put('/api/visual-chain/edit', async (req, res) => {
+  try {
+    const { table, id, fields, ownerRepoint } = req.body || {};
+    if (!CHAIN_EDITABLE_TABLES.has(table)) {
+      return res.status(400).json({ error: `Unsupported table: ${table}` });
+    }
+    const rowId = Number(id);
+    if (!Number.isFinite(rowId) || rowId <= 0) {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+    if (!fields || typeof fields !== 'object' || !Object.keys(fields).length) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    if (ownerRepoint && (!ownerRepoint.table || !Number.isFinite(Number(ownerRepoint.id)) || !ownerRepoint.column)) {
+      return res.status(400).json({ error: 'Invalid ownerRepoint' });
+    }
+
+    const sharedCountBefore = await countChainReferences(table, rowId);
+    const needsClone = sharedCountBefore > 1;
+
+    const outcome = await withCustomSpellConnection(async (conn) => {
+      let finalId = rowId;
+      let cloned = false;
+
+      if (needsClone) {
+        const [[existing]] = await conn.query(`SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`${table}\` WHERE ID=? LIMIT 1`, [rowId]);
+        if (!existing) throw new Error(`${table} row ${rowId} not found`);
+
+        const [[maxRow]] = await conn.query(
+          `SELECT COALESCE(MAX(ID),899999) AS maxId FROM \`${CUSTOM_SPELL_DB}\`.\`${table}\` WHERE ID >= 900000`
+        );
+        finalId = Math.max(900000, Number(maxRow.maxId) + 1);
+
+        const newRow = { ...existing, ...fields, ID: finalId };
+        const columns = Object.keys(newRow);
+        await conn.query(
+          `INSERT INTO \`${CUSTOM_SPELL_DB}\`.\`${table}\` (${columns.map((c) => `\`${c}\``).join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`,
+          columns.map((c) => newRow[c])
+        );
+        cloned = true;
+
+        // Cloning a shared kit must also clone the model-attach rows it
+        // owns, repointed at the clone - otherwise the clone would keep
+        // referencing (and risk corrupting) the original kit's attachments.
+        if (table === 'spellvisualkit') {
+          const [attachRows] = await conn.query(
+            `SELECT * FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisualkitmodelattach\` WHERE ParentSpellVisualKitId=?`,
+            [rowId]
+          );
+          for (const attachRow of attachRows || []) {
+            const [[attachMax]] = await conn.query(
+              `SELECT COALESCE(MAX(ID),0) AS maxId FROM \`${CUSTOM_SPELL_DB}\`.\`spellvisualkitmodelattach\``
+            );
+            const newAttachRow = { ...attachRow, ID: Number(attachMax.maxId) + 1, ParentSpellVisualKitId: finalId };
+            const acols = Object.keys(newAttachRow);
+            await conn.query(
+              `INSERT INTO \`${CUSTOM_SPELL_DB}\`.\`spellvisualkitmodelattach\` (${acols.map((c) => `\`${c}\``).join(', ')}) VALUES (${acols.map(() => '?').join(', ')})`,
+              acols.map((c) => newAttachRow[c])
+            );
+          }
+        }
+      } else {
+        const setSql = Object.keys(fields).map((c) => `\`${c}\` = ?`).join(', ');
+        await conn.query(
+          `UPDATE \`${CUSTOM_SPELL_DB}\`.\`${table}\` SET ${setSql} WHERE \`ID\` = ?`,
+          [...Object.values(fields), rowId]
+        );
+      }
+
+      if (cloned && ownerRepoint) {
+        await conn.query(
+          `UPDATE \`${CUSTOM_SPELL_DB}\`.\`${ownerRepoint.table}\` SET \`${ownerRepoint.column}\` = ? WHERE \`ID\` = ?`,
+          [finalId, Number(ownerRepoint.id)]
+        );
+      }
+
+      return { finalId, cloned };
+    });
+
+    res.json({ success: true, table, requestedId: rowId, sharedCountBefore, ...outcome });
+  } catch (error) {
+    console.error('Error editing visual-chain row:', error);
+    logErrorToFile(`Error editing visual-chain row: ${error.stack || error}`);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -3644,7 +4222,13 @@ app.post('/api/upload-icon', (req, res) => {
         initializeSpellIconDbc(exportDbcPath);
       }
     }
-    addIconToSpellIconDbc(exportDbcPath, finalFilename);
+    const iconDbcResult = addIconToSpellIconDbc(exportDbcPath, finalFilename);
+    if (iconDbcResult && iconDbcResult.success && iconDbcResult.id != null) {
+      // Keep sdbeditor.spellicon in sync immediately so this icon isn't
+      // treated as "unknown to SQL" by the quarantine safety net.
+      upsertSpellIconRows([{ id: iconDbcResult.id, name: iconDbcResult.filename || cleanName }])
+        .catch(err => console.error('Failed to sync uploaded icon to SQL:', err.message));
+    }
 
     // Trigger full manifest update in background (return immediately, update in progress)
     loadIconListCache(iconDir);
@@ -3905,117 +4489,636 @@ app.post('/api/export-icons', (req, res) => {
   }
 });
 
+function runSpellDbcLocalePreflight(spellDbcPath, { dryRun = false } = {}) {
+  if (!spellDbcPath || !fs.existsSync(spellDbcPath)) {
+    return {
+      ok: false,
+      error: `Spell.dbc not found at ${spellDbcPath || '(unknown path)'}`,
+      spellDbcPath,
+      dryRun,
+    };
+  }
+
+  if (!fs.existsSync(SPELL_DBC_FIXER_PATH)) {
+    return {
+      ok: false,
+      error: `Spell.dbc fixer script not found at ${SPELL_DBC_FIXER_PATH}`,
+      spellDbcPath,
+      dryRun,
+    };
+  }
+
+  const args = [SPELL_DBC_FIXER_PATH, '--json'];
+  if (dryRun) args.push('--dry-run');
+  args.push(spellDbcPath);
+
+  const result = spawnSync('python3', args, {
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  });
+
+  const stdout = String(result.stdout || '').trim();
+  const stderr = String(result.stderr || '').trim();
+  let payload = null;
+
+  if (stdout) {
+    try {
+      payload = JSON.parse(stdout);
+    } catch (err) {
+      payload = null;
+    }
+  }
+
+  return {
+    ok: result.status !== null && result.status !== 2,
+    exitCode: result.status,
+    signal: result.signal,
+    payload,
+    stdout,
+    stderr,
+    spellDbcPath,
+    dryRun,
+  };
+}
+
+function importServerDbcFiles(config) {
+  const publicDbcPath = path.join(PUBLIC_DIR, getBaseDBCDir(config));
+
+  let sourceDir = SERVER_DBC_DIR;
+  let sourceLabel = 'server';
+  if (!fs.existsSync(sourceDir)) {
+    sourceDir = BACKUP_DBC_DIR;
+    sourceLabel = 'backup';
+  }
+
+  if (!fs.existsSync(publicDbcPath)) {
+    fs.mkdirSync(publicDbcPath, { recursive: true });
+  }
+
+  if (!fs.existsSync(sourceDir)) {
+    return {
+      success: false,
+      error: `DBC source folder not found: ${SERVER_DBC_DIR} or ${BACKUP_DBC_DIR}`,
+      source: sourceDir,
+      sourceLabel,
+    };
+  }
+
+  const files = fs.readdirSync(sourceDir);
+  const dbcFiles = files.filter(f => f.toLowerCase().endsWith('.dbc'));
+
+  if (dbcFiles.length === 0) {
+    return {
+      success: true,
+      message: `No DBC files found in ${sourceLabel} folder`,
+      imported: [],
+      skipped: 0,
+      total: 0,
+      source: sourceDir,
+      sourceLabel,
+      spellIconEntries: 0,
+      spellNameEntries: 0,
+      spellDbcFound: false,
+      spellIconDbcFound: false,
+    };
+  }
+
+  const imported = [];
+  const skipped = [];
+  dbcFiles.forEach(file => {
+    const srcFile = path.join(sourceDir, file);
+    const destFile = path.join(publicDbcPath, file);
+
+    try {
+      const srcStats = fs.statSync(srcFile);
+      const destExists = fs.existsSync(destFile);
+
+      if (!destExists) {
+        fs.copyFileSync(srcFile, destFile);
+        imported.push({ file, size: srcStats.size, status: 'new' });
+      } else {
+        const destStats = fs.statSync(destFile);
+        if (srcStats.size !== destStats.size || srcStats.mtimeMs > destStats.mtimeMs) {
+          fs.copyFileSync(srcFile, destFile);
+          imported.push({ file, size: srcStats.size, status: 'updated' });
+        } else {
+          skipped.push(file);
+        }
+      }
+    } catch (err) {
+      console.error(`Failed to import DBC ${file}:`, err);
+    }
+  });
+
+  if (imported.length > 0) {
+    dbcCache.talents = null;
+    dbcCache.talentTabs = null;
+    dbcCache.spellIconIndex = null;
+    dbcCache.spellNameIndex = null;
+    if (dbcCache.lastModified) {
+      dbcCache.lastModified.talentDbc = 0;
+      dbcCache.lastModified.talentTabDbc = 0;
+    }
+  }
+
+  let spellIconEntries = 0;
+  let spellNameEntries = 0;
+  let spellDbcFound = false;
+  let spellIconDbcFound = false;
+  try {
+    const spellDbcPath = path.join(publicDbcPath, 'Spell.dbc');
+    const spellIconDbcPath = path.join(publicDbcPath, 'SpellIcon.dbc');
+    spellDbcFound = fs.existsSync(spellDbcPath);
+    spellIconDbcFound = fs.existsSync(spellIconDbcPath);
+
+    const iconIndex = buildSpellIconIndex(config);
+    const nameEntries = buildSpellNameIndex(config);
+    spellIconEntries = iconIndex ? Object.keys(iconIndex).length : 0;
+    spellNameEntries = nameEntries ? nameEntries.length : 0;
+  } catch (err) {
+    console.error('DBC sync index rebuild error:', err);
+  }
+
+  return {
+    success: true,
+    message: `Imported ${imported.length} DBC files, ${skipped.length} already up to date`,
+    imported,
+    skipped: skipped.length,
+    total: dbcFiles.length,
+    source: sourceDir,
+    sourceLabel,
+    spellIconEntries,
+    spellNameEntries,
+    spellDbcFound,
+    spellIconDbcFound,
+  };
+}
+
 // Import/sync DBC files from the server's data folder into public/dbc
 app.post('/api/import-server-dbc', (req, res) => {
   try {
     const config = loadConfigFile();
-    const publicDbcPath = path.join(PUBLIC_DIR, getBaseDBCDir(config));
-
-    let sourceDir = SERVER_DBC_DIR;
-    let sourceLabel = 'server';
-    if (!fs.existsSync(sourceDir)) {
-      sourceDir = BACKUP_DBC_DIR;
-      sourceLabel = 'backup';
+    const result = importServerDbcFiles(config);
+    if (!result.success) {
+      return res.status(400).json({ error: result.error || 'Failed to import DBC files', ...result });
     }
 
-    // Ensure public dbc exists
-    if (!fs.existsSync(publicDbcPath)) {
-      fs.mkdirSync(publicDbcPath, { recursive: true });
-    }
-
-    if (!fs.existsSync(sourceDir)) {
-      return res.status(400).json({ error: `DBC source folder not found: ${SERVER_DBC_DIR} or ${BACKUP_DBC_DIR}` });
-    }
-
-    const files = fs.readdirSync(sourceDir);
-    const dbcFiles = files.filter(f => f.toLowerCase().endsWith('.dbc'));
-
-    if (dbcFiles.length === 0) {
-      return res.json({
-        success: true,
-        message: `No DBC files found in ${sourceLabel} folder`,
-        imported: [],
-        source: sourceDir,
-        sourceLabel,
-      });
-    }
-
-    const imported = [];
-    const skipped = [];
-    dbcFiles.forEach(file => {
-      const srcFile = path.join(sourceDir, file);
-      const destFile = path.join(publicDbcPath, file);
-
-      try {
-        const srcStats = fs.statSync(srcFile);
-        const destExists = fs.existsSync(destFile);
-
-        if (!destExists) {
-          fs.copyFileSync(srcFile, destFile);
-          imported.push({ file, size: srcStats.size, status: 'new' });
-        } else {
-          const destStats = fs.statSync(destFile);
-          // Only copy if file size differs or source is newer
-          if (srcStats.size !== destStats.size || srcStats.mtimeMs > destStats.mtimeMs) {
-            fs.copyFileSync(srcFile, destFile);
-            imported.push({ file, size: srcStats.size, status: 'updated' });
-          } else {
-            skipped.push(file);
-          }
-        }
-      } catch (err) {
-        console.error(`Failed to import DBC ${file}:`, err);
-      }
-    });
-
-    // Invalidate caches since DBC files changed
-    if (imported.length > 0) {
-      dbcCache.talents = null;
-      dbcCache.talentTabs = null;
-      dbcCache.spellIconIndex = null;
-      dbcCache.spellNameIndex = null;
-      if (dbcCache.lastModified) {
-        dbcCache.lastModified.talentDbc = 0;
-        dbcCache.lastModified.talentTabDbc = 0;
-      }
-    }
-
-    let spellIconEntries = 0;
-    let spellNameEntries = 0;
-    let spellDbcFound = false;
-    let spellIconDbcFound = false;
-    try {
-      const spellDbcPath = path.join(publicDbcPath, 'Spell.dbc');
-      const spellIconDbcPath = path.join(publicDbcPath, 'SpellIcon.dbc');
-      spellDbcFound = fs.existsSync(spellDbcPath);
-      spellIconDbcFound = fs.existsSync(spellIconDbcPath);
-
-      const iconIndex = buildSpellIconIndex(config);
-      const nameEntries = buildSpellNameIndex(config);
-      spellIconEntries = iconIndex ? Object.keys(iconIndex).length : 0;
-      spellNameEntries = nameEntries ? nameEntries.length : 0;
-    } catch (err) {
-      console.error('DBC sync index rebuild error:', err);
-    }
-
-    console.log(`✓ Imported ${imported.length} DBC files from ${sourceLabel} (${skipped.length} already up to date)`);
-    res.json({
-      success: true,
-      message: `Imported ${imported.length} DBC files, ${skipped.length} already up to date`,
-      imported,
-      skipped: skipped.length,
-      total: dbcFiles.length,
-      source: sourceDir,
-      sourceLabel,
-      spellIconEntries,
-      spellNameEntries,
-      spellDbcFound,
-      spellIconDbcFound,
-    });
+    console.log(`✓ ${result.message}`);
+    res.json(result);
   } catch (error) {
     console.error('DBC import error:', error);
     logErrorToFile(`DBC import error: ${error.stack || error}`);
     res.status(500).json({ error: 'Import error: ' + error.message });
+  }
+});
+
+const UNLISTED_ICON_SUBDIR = '_unlisted';
+
+// Lowercase, extension-stripped, path-stripped key — matches how icon
+// FILENAMES are normalized on disk (see dbc-updater.js's normalizeIconName).
+// Used for file <-> SQL matching in the quarantine safety net.
+function normalizeIconFileKey(input) {
+  if (!input) return '';
+  let name = String(input).replace(/\\/g, '/');
+  if (name.includes('/')) name = name.substring(name.lastIndexOf('/') + 1);
+  name = name.toLowerCase();
+  name = name.replace(/\.blp$/i, '');
+  return name.trim();
+}
+
+// Case-preserving, extension-stripped, path-stripped key — matches the
+// existing binary-DBC-derived spell-icon index contract (frontend builds
+// thumbnail URLs directly from this casing).
+function iconIndexKeyFromSqlName(input) {
+  if (!input) return '';
+  let name = String(input).replace(/\\/g, '/');
+  if (name.includes('/')) name = name.substring(name.lastIndexOf('/') + 1);
+  name = name.replace(/\.[^.]+$/, '');
+  return name.trim();
+}
+
+function buildSpellIconSqlPath(baseName) {
+  return `Interface\\Icons\\${baseName}`;
+}
+
+// Build the spellId -> iconBaseName map directly from sdbeditor SQL
+// (spell.SpellIconID -> spellicon.Name), avoiding a binary DBC parse.
+// Returns null if the sdbeditor DB is unreachable or empty (caller should
+// fall back to the binary-DBC-based buildSpellIconIndex()).
+async function buildSpellIconIndexFromSql(config) {
+  try {
+    const rows = await withCustomSpellConnection(async (conn) => {
+      const [r] = await conn.query(
+        `SELECT s.\`ID\` AS spellId, si.\`Name\` AS iconName
+         FROM \`${CUSTOM_SPELL_DB}\`.\`spell\` s
+         INNER JOIN \`${CUSTOM_SPELL_DB}\`.\`spellicon\` si ON si.\`ID\` = s.\`SpellIconID\`
+         WHERE si.\`Name\` IS NOT NULL AND si.\`Name\` <> ''`
+      );
+      return r;
+    });
+    if (!rows || !rows.length) return null;
+
+    const index = {};
+    for (const row of rows) {
+      const key = iconIndexKeyFromSqlName(row.iconName);
+      if (key) index[Number(row.spellId)] = key;
+    }
+    return index;
+  } catch (err) {
+    console.error('⚠ Failed to build spell-icon index from SQL:', err.message);
+    return null;
+  }
+}
+
+// Write a pre-built spell-icon index to the same disk cache path/shape that
+// buildSpellIconIndex() uses, so every other consumer (loadOrBuildSpellIconIndex,
+// Talent API, Spell Editor lookups) transparently picks up SQL-sourced data
+// without needing to re-parse Spell.dbc/SpellIcon.dbc themselves.
+function persistSpellIconIndexToDisk(index, extraMeta = {}) {
+  const meta = {
+    builtAt: new Date().toISOString(),
+    spellCount: Object.keys(index).length,
+    ...extraMeta,
+  };
+  const payload = { meta, index };
+  fs.writeFileSync(SPELL_ICON_INDEX_PATH, JSON.stringify(payload));
+  dbcCache.spellIconIndex = index;
+  return payload;
+}
+
+// Push newly-assigned SpellIcon.dbc entries (from syncSpellIconDbcFromIcons)
+// into sdbeditor.spellicon so brand-new custom icons are immediately known
+// to SQL, before the quarantine safety net runs.
+async function upsertSpellIconRows(entries) {
+  if (!Array.isArray(entries) || !entries.length) return { upserted: 0 };
+  try {
+    const result = await withCustomSpellConnection(async (conn) => {
+      for (const entry of entries) {
+        await conn.query(
+          `INSERT INTO \`${CUSTOM_SPELL_DB}\`.\`spellicon\` (\`ID\`, \`Name\`) VALUES (?, ?)
+           ON DUPLICATE KEY UPDATE \`Name\` = VALUES(\`Name\`)`,
+          [entry.id, buildSpellIconSqlPath(entry.name)]
+        );
+      }
+      return { upserted: entries.length };
+    });
+    return result || { upserted: 0, error: 'sdbeditor SQL connection unavailable' };
+  } catch (err) {
+    console.error('⚠ Failed to upsert spellicon SQL rows:', err.message);
+    return { upserted: 0, error: err.message };
+  }
+}
+
+// Icon safety net: quarantine any icon file in the main Icons folder whose
+// name isn't referenced by any row in sdbeditor.spellicon into a sibling
+// "_unlisted" folder (keeping the main folder limited to SQL-known icons),
+// and restore any previously-quarantined file that IS now referenced.
+async function runIconQuarantine(config) {
+  const iconDir = getIconDirPath(config);
+  const unlistedDir = path.join(iconDir, UNLISTED_ICON_SUBDIR);
+
+  if (!fs.existsSync(iconDir)) {
+    return { success: false, error: `Icon directory not found: ${iconDir}` };
+  }
+
+  let knownRows;
+  try {
+    knownRows = await withCustomSpellConnection(async (conn) => {
+      const [rows] = await conn.query(
+        `SELECT \`Name\` FROM \`${CUSTOM_SPELL_DB}\`.\`spellicon\` WHERE \`Name\` IS NOT NULL AND \`Name\` <> ''`
+      );
+      return rows;
+    });
+  } catch (err) {
+    return { success: false, error: `sdbeditor SQL query failed: ${err.message}` };
+  }
+
+  if (!knownRows) {
+    return { success: false, skipped: true, error: 'sdbeditor SQL connection unavailable; skipped icon quarantine' };
+  }
+
+  const knownSet = new Set(knownRows.map((r) => normalizeIconFileKey(r.Name)).filter(Boolean));
+
+  if (!fs.existsSync(unlistedDir)) {
+    fs.mkdirSync(unlistedDir, { recursive: true });
+  }
+
+  const mainFiles = fs.readdirSync(iconDir).filter((f) => f.toLowerCase().endsWith('.blp'));
+  const quarantined = [];
+  for (const file of mainFiles) {
+    if (!knownSet.has(normalizeIconFileKey(file))) {
+      try {
+        fs.renameSync(path.join(iconDir, file), path.join(unlistedDir, file));
+        quarantined.push(file);
+      } catch (err) {
+        console.error(`Failed to quarantine icon ${file}:`, err.message);
+      }
+    }
+  }
+
+  const unlistedFiles = fs.readdirSync(unlistedDir).filter((f) => f.toLowerCase().endsWith('.blp'));
+  const restored = [];
+  for (const file of unlistedFiles) {
+    if (knownSet.has(normalizeIconFileKey(file))) {
+      try {
+        fs.renameSync(path.join(unlistedDir, file), path.join(iconDir, file));
+        restored.push(file);
+      } catch (err) {
+        console.error(`Failed to restore icon ${file}:`, err.message);
+      }
+    }
+  }
+
+  if (quarantined.length || restored.length) {
+    try {
+      loadIconListCache(iconDir);
+      persistIconListCache();
+    } catch (err) {
+      console.error('Failed to refresh icon list cache after quarantine:', err.message);
+    }
+  }
+
+  return {
+    success: true,
+    knownIconCount: knownSet.size,
+    mainFolderCount: mainFiles.length - quarantined.length + restored.length,
+    quarantinedCount: quarantined.length,
+    quarantined,
+    restoredCount: restored.length,
+    restored,
+    unlistedDir,
+  };
+}
+
+app.post('/api/icon-quarantine/run', async (req, res) => {
+  try {
+    const config = loadConfigFile();
+    const result = await runIconQuarantine(config);
+    if (!result.success) {
+      return res.status(result.skipped ? 200 : 400).json(result);
+    }
+    res.json(result);
+  } catch (error) {
+    console.error('Icon quarantine error:', error);
+    logErrorToFile(`Icon quarantine error: ${error.stack || error}`);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// List icons currently sitting in the "_unlisted" quarantine folder so the
+// UI can offer a quick multi-select "Import" workflow.
+app.get('/api/unlisted-icons', (req, res) => {
+  try {
+    const config = loadConfigFile();
+    const iconDir = getIconDirPath(config);
+    const unlistedDir = path.join(iconDir, UNLISTED_ICON_SUBDIR);
+
+    if (!fs.existsSync(unlistedDir)) {
+      return res.json({ files: [], count: 0, unlistedDir });
+    }
+
+    const files = fs.readdirSync(unlistedDir)
+      .filter((f) => f.toLowerCase().endsWith('.blp'))
+      .sort((a, b) => a.localeCompare(b));
+
+    res.json({ files, count: files.length, unlistedDir });
+  } catch (error) {
+    console.error('List unlisted icons error:', error);
+    logErrorToFile(`List unlisted icons error: ${error.stack || error}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// One-click "add new icon" workflow for previously-quarantined files:
+// assigns each selected icon a SpellIcon.dbc ID, upserts sdbeditor.spellicon,
+// and moves the file back into the main Icons folder — replacing the old
+// manual "drop file -> add to SQL -> add to DBC" 3-step process.
+app.post('/api/unlisted-icons/import', async (req, res) => {
+  try {
+    const requested = Array.isArray(req.body?.files) ? req.body.files : [];
+    if (!requested.length) {
+      return res.status(400).json({ error: 'No files specified' });
+    }
+
+    const config = loadConfigFile();
+    const iconDir = getIconDirPath(config);
+    const unlistedDir = path.join(iconDir, UNLISTED_ICON_SUBDIR);
+    const exportDbcDir = path.join(EXPORT_DIR, 'DBFilesClient');
+    const exportDbcPath = path.join(exportDbcDir, 'SpellIcon.dbc');
+    const baseSpellIconPath = path.join(PUBLIC_DIR, getBaseDBCDir(config), 'SpellIcon.dbc');
+
+    if (!fs.existsSync(exportDbcDir)) {
+      fs.mkdirSync(exportDbcDir, { recursive: true });
+    }
+    if (!fs.existsSync(exportDbcPath)) {
+      if (fs.existsSync(baseSpellIconPath)) {
+        fs.copyFileSync(baseSpellIconPath, exportDbcPath);
+      } else {
+        initializeSpellIconDbc(exportDbcPath);
+      }
+    }
+
+    const imported = [];
+    const failed = [];
+
+    for (const rawName of requested) {
+      const filename = path.basename(String(rawName || ''));
+      if (!filename) {
+        failed.push({ file: rawName, error: 'Invalid filename' });
+        continue;
+      }
+      const srcPath = path.join(unlistedDir, filename);
+      if (!fs.existsSync(srcPath)) {
+        failed.push({ file: filename, error: 'File not found in _unlisted' });
+        continue;
+      }
+
+      try {
+        const dbcResult = addIconToSpellIconDbc(exportDbcPath, filename);
+        if (!dbcResult || !dbcResult.success) {
+          failed.push({ file: filename, error: 'Failed to add icon to SpellIcon.dbc' });
+          continue;
+        }
+
+        const sqlResult = await upsertSpellIconRows([{ id: dbcResult.id, name: dbcResult.filename }]);
+        fs.renameSync(srcPath, path.join(iconDir, filename));
+
+        imported.push({
+          file: filename,
+          id: dbcResult.id,
+          alreadyInDbc: !!dbcResult.skipped,
+          sqlUpserted: !sqlResult?.error,
+        });
+      } catch (err) {
+        failed.push({ file: filename, error: err.message });
+      }
+    }
+
+    if (imported.length) {
+      loadIconListCache(iconDir);
+      for (const entry of imported) iconListCache.add(entry.file);
+      persistIconListCache();
+    }
+
+    res.json({
+      success: failed.length === 0,
+      importedCount: imported.length,
+      failedCount: failed.length,
+      imported,
+      failed,
+    });
+  } catch (error) {
+    console.error('Import unlisted icons error:', error);
+    logErrorToFile(`Import unlisted icons error: ${error.stack || error}`);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/sync-workflow/run', async (req, res) => {
+  try {
+    const startTime = Date.now();
+    const config = loadConfigFile();
+    const options = {
+      autoRepairLocaleOffsets: req.body?.autoRepairLocaleOffsets !== false,
+      runSpellIconSync: req.body?.runSpellIconSync !== false,
+      runIconQuarantine: req.body?.runIconQuarantine !== false,
+    };
+
+    const stages = [];
+
+    const importStage = {
+      name: 'import-server-dbc',
+      ok: false,
+      details: null,
+    };
+    const importResult = importServerDbcFiles(config);
+    importStage.ok = !!importResult.success;
+    importStage.details = importResult;
+    stages.push(importStage);
+    if (!importResult.success) {
+      return res.status(400).json({
+        success: false,
+        options,
+        durationMs: Date.now() - startTime,
+        stages,
+        error: importResult.error || 'Import stage failed',
+      });
+    }
+
+    const publicSpellDbcPath = path.join(PUBLIC_DIR, getBaseDBCDir(config), 'Spell.dbc');
+    const localePreflight = runSpellDbcLocalePreflight(publicSpellDbcPath, { dryRun: true });
+    const localeStage = {
+      name: 'spell-locale-preflight',
+      ok: !!localePreflight.ok,
+      details: {
+        dryRun: localePreflight,
+      },
+    };
+
+    if (localePreflight.ok
+      && localePreflight.payload
+      && Number(localePreflight.payload.fixedCount || 0) > 0
+      && options.autoRepairLocaleOffsets) {
+      const repair = runSpellDbcLocalePreflight(publicSpellDbcPath, { dryRun: false });
+      localeStage.ok = !!repair.ok;
+      localeStage.details.repair = repair;
+    }
+    stages.push(localeStage);
+
+    // Spell-icon DBC sync runs BEFORE the quarantine safety net so brand-new
+    // custom icons get assigned an ID + a sdbeditor.spellicon SQL row first —
+    // otherwise they'd look "unknown to SQL" and get quarantined immediately.
+    if (options.runSpellIconSync) {
+      const spellIconStage = {
+        name: 'spell-icon-sync',
+        ok: false,
+        details: null,
+      };
+      try {
+        const iconDir = getIconDirPath(config);
+        const sourceDbcPath = path.join(PUBLIC_DIR, getBaseDBCDir(config), 'SpellIcon.dbc');
+        const outputDbcPath = path.join(EXPORT_DIR, 'DBFilesClient', 'SpellIcon.dbc');
+        const iconList = loadOrBuildIconList(iconDir);
+        const result = syncSpellIconDbcFromIcons(sourceDbcPath, iconDir, outputDbcPath, iconList);
+        spellIconStage.ok = !!result.success;
+        spellIconStage.details = result;
+
+        if (result.success && Array.isArray(result.addedEntries) && result.addedEntries.length) {
+          const sqlUpsert = await upsertSpellIconRows(result.addedEntries);
+          spellIconStage.details.sqlUpsert = sqlUpsert;
+        }
+      } catch (err) {
+        spellIconStage.ok = false;
+        spellIconStage.details = { success: false, error: err.message };
+      }
+      stages.push(spellIconStage);
+    }
+
+    if (options.runIconQuarantine) {
+      const quarantineStage = {
+        name: 'icon-quarantine',
+        ok: false,
+        details: null,
+      };
+      try {
+        const result = await runIconQuarantine(config);
+        // Missing SQL connectivity is treated as a soft-skip, not a hard
+        // failure, so the rest of the sync pipeline can still succeed.
+        quarantineStage.ok = result.success || !!result.skipped;
+        quarantineStage.details = result;
+      } catch (err) {
+        quarantineStage.ok = false;
+        quarantineStage.details = { success: false, error: err.message };
+      }
+      stages.push(quarantineStage);
+    }
+
+    const indexStage = {
+      name: 'rebuild-indexes',
+      ok: false,
+      details: null,
+    };
+    try {
+      let iconIndex = await buildSpellIconIndexFromSql(config);
+      let iconIndexSource = 'sql';
+      if (iconIndex) {
+        persistSpellIconIndexToDisk(iconIndex, { source: 'sql' });
+      } else {
+        iconIndex = buildSpellIconIndex(config);
+        iconIndexSource = iconIndex ? 'dbc-binary-fallback' : 'unavailable';
+      }
+      const nameEntries = buildSpellNameIndex(config);
+      indexStage.ok = true;
+      indexStage.details = {
+        spellIconEntries: iconIndex ? Object.keys(iconIndex).length : 0,
+        spellIconSource: iconIndexSource,
+        spellNameEntries: Array.isArray(nameEntries) ? nameEntries.length : 0,
+      };
+    } catch (err) {
+      indexStage.ok = false;
+      indexStage.details = { error: err.message };
+    }
+    stages.push(indexStage);
+
+    const failedStage = stages.find((s) => !s.ok);
+    return res.status(failedStage ? 400 : 200).json({
+      success: !failedStage,
+      options,
+      durationMs: Date.now() - startTime,
+      stages,
+      active: {
+        dbc: getActiveDBCDir(config),
+        icons: getActiveIconDir(config),
+      },
+      exportPaths: {
+        dbcs: path.join(EXPORT_DIR, 'DBFilesClient'),
+        icons: path.join(EXPORT_DIR, 'Interface', 'Icons'),
+      },
+    });
+  } catch (error) {
+    console.error('Sync workflow error:', error);
+    logErrorToFile(`Sync workflow error: ${error.stack || error}`);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -4269,6 +5372,45 @@ app.post('/api/icon-list/rebuild', (req, res) => {
   }
 });
 
+// GET last-known-backup summary + full backup history, shown next to DBC Sync + Validation.
+app.get('/api/dbc-backup/status', (req, res) => {
+  try {
+    const backups = listDbcBackups();
+    res.json({
+      success: true,
+      lastBackup: backups[0] || null,
+      count: backups.length,
+      backups: backups.slice(0, 30),
+    });
+  } catch (error) {
+    console.error('Error listing DBC backups:', error);
+    logErrorToFile(`Error listing DBC backups: ${error.stack || error}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Manually trigger a DBC backup right now (always creates a new snapshot,
+// distinct from the automatic once-per-day folder, using a timestamped name).
+app.post('/api/dbc-backup/run', (req, res) => {
+  try {
+    const folderName = manualDbcBackupFolderName();
+    const result = createDbcBackupSnapshot(folderName);
+    res.json({
+      success: true,
+      lastBackup: {
+        name: result.folderName,
+        manual: true,
+        mtime: new Date().toISOString(),
+        fileCount: result.fileCount,
+      },
+    });
+  } catch (error) {
+    console.error('Manual DBC backup failed:', error);
+    logErrorToFile(`Manual DBC backup failed: ${error.stack || error}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // 404 handler - return JSON instead of HTML
 app.use((req, res) => {
   console.warn(`404: ${req.method} ${req.path}`);
@@ -4287,16 +5429,93 @@ app.use((err, req, res, next) => {
 
 // ─── Daily DBC Backup ────────────────────────────────────────────────
 // On first server start each day, back up all DBC files to the module's backups/ folder
+const DBC_BACKUP_ROOT = path.resolve(__dirname, '..', 'backups');
+const DBC_BACKUP_SOURCE_LABELS = ['base-dbc', 'export-dbc'];
+
+function getDbcBackupSources(config) {
+  return [
+    { label: 'base-dbc', dir: path.join(PUBLIC_DIR, config.paths.base.dbc) },
+    { label: 'export-dbc', dir: path.join(EXPORT_DIR, 'DBFilesClient') },
+  ];
+}
+
+// Copies the current DBC sources into backups/<folderName>/{base-dbc,export-dbc}.
+// Shared by the automatic once-per-day backup and the manual "Backup Now" endpoint.
+function createDbcBackupSnapshot(folderName) {
+  const destRootDir = path.join(DBC_BACKUP_ROOT, folderName);
+  fs.mkdirSync(destRootDir, { recursive: true });
+
+  const config = loadConfigFile();
+  const sources = getDbcBackupSources(config);
+
+  let totalCopied = 0;
+  for (const src of sources) {
+    if (!fs.existsSync(src.dir)) continue;
+
+    const destDir = path.join(destRootDir, src.label);
+    fs.mkdirSync(destDir, { recursive: true });
+
+    const files = fs.readdirSync(src.dir).filter(f => f.endsWith('.dbc'));
+    for (const file of files) {
+      fs.copyFileSync(path.join(src.dir, file), path.join(destDir, file));
+      totalCopied++;
+    }
+  }
+
+  return { folderName, path: destRootDir, fileCount: totalCopied };
+}
+
+function todaysDbcBackupFolderName() {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const year = now.getFullYear();
+  return `${month}-${day}-${year}`;
+}
+
+function manualDbcBackupFolderName() {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const year = now.getFullYear();
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  return `manual-${month}-${day}-${year}_${hours}-${minutes}-${seconds}`;
+}
+
+// Lists every backup snapshot folder under backups/, newest first, with a
+// per-snapshot DBC file count so the UI can show "last known backup".
+function listDbcBackups() {
+  if (!fs.existsSync(DBC_BACKUP_ROOT)) return [];
+
+  return fs.readdirSync(DBC_BACKUP_ROOT, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const dirPath = path.join(DBC_BACKUP_ROOT, entry.name);
+      const stat = fs.statSync(dirPath);
+      let fileCount = 0;
+      for (const label of DBC_BACKUP_SOURCE_LABELS) {
+        const subDir = path.join(dirPath, label);
+        if (fs.existsSync(subDir)) {
+          fileCount += fs.readdirSync(subDir).filter((f) => f.endsWith('.dbc')).length;
+        }
+      }
+      return {
+        name: entry.name,
+        manual: entry.name.startsWith('manual-'),
+        mtime: stat.mtime.toISOString(),
+        mtimeMs: stat.mtimeMs,
+        fileCount,
+      };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
 function performDailyBackup() {
   try {
-    const now = new Date();
-    const month = String(now.getMonth() + 1).padStart(2, '0');
-    const day = String(now.getDate()).padStart(2, '0');
-    const year = now.getFullYear();
-    const dateLabel = `${month}-${day}-${year}`;
-
-    const backupRoot = path.resolve(__dirname, '..', 'backups');
-    const todayDir = path.join(backupRoot, dateLabel);
+    const dateLabel = todaysDbcBackupFolderName();
+    const todayDir = path.join(DBC_BACKUP_ROOT, dateLabel);
 
     // If today's backup folder already exists, skip
     if (fs.existsSync(todayDir)) {
@@ -4304,29 +5523,8 @@ function performDailyBackup() {
       return;
     }
 
-    fs.mkdirSync(todayDir, { recursive: true });
-
-    const config = loadConfigFile();
-    const sources = [
-      { label: 'base-dbc', dir: path.join(PUBLIC_DIR, config.paths.base.dbc) },
-      { label: 'export-dbc', dir: path.join(EXPORT_DIR, 'DBFilesClient') },
-    ];
-
-    let totalCopied = 0;
-    for (const src of sources) {
-      if (!fs.existsSync(src.dir)) continue;
-
-      const destDir = path.join(todayDir, src.label);
-      fs.mkdirSync(destDir, { recursive: true });
-
-      const files = fs.readdirSync(src.dir).filter(f => f.endsWith('.dbc'));
-      for (const file of files) {
-        fs.copyFileSync(path.join(src.dir, file), path.join(destDir, file));
-        totalCopied++;
-      }
-    }
-
-    console.log(`✓ Daily backup created: ${dateLabel} (${totalCopied} DBC files)`);
+    const result = createDbcBackupSnapshot(dateLabel);
+    console.log(`✓ Daily backup created: ${dateLabel} (${result.fileCount} DBC files)`);
   } catch (err) {
     console.error('Daily backup failed:', err);
     logErrorToFile(`Daily backup failed: ${err.stack || err}`);

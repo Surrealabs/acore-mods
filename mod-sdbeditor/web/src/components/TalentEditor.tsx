@@ -471,19 +471,58 @@ export default function TalentEditor(_props: TalentEditorProps) {
     setDragSource(source);
   };
 
+  const getZonePool = (zone: TalentZone): TalentDef[] => {
+    if (zone.type === 'class') return classTree.talents;
+    if (zone.type === 'spec') return currentSpec?.talents || [];
+    return heroTrees[zone.heroIdx ?? 0]?.talents || [];
+  };
+
+  const removeFromZone = (zone: TalentZone, talentId: number) => {
+    if (zone.type === 'class') {
+      setClassTree((tree) => ({ ...tree, talents: tree.talents.filter(t => t.id !== talentId) }));
+    } else if (zone.type === 'spec') {
+      setSpec(activeSpecIdx, (spec) => ({ ...spec, talents: spec.talents.filter(t => t.id !== talentId) }));
+    } else {
+      setHeroTree(activeSpecIdx, zone.heroIdx || 0, (tree) => ({ ...tree, talents: tree.talents.filter(t => t.id !== talentId) }));
+    }
+  };
+
+  const addToZone = (zone: TalentZone, talent: TalentDef) => {
+    if (zone.type === 'class') {
+      setClassTree((tree) => ({ ...tree, talents: [...tree.talents, talent] }));
+    } else if (zone.type === 'spec') {
+      setSpec(activeSpecIdx, (spec) => ({ ...spec, talents: [...spec.talents, talent] }));
+    } else {
+      setHeroTree(activeSpecIdx, zone.heroIdx || 0, (tree) => ({ ...tree, talents: [...tree.talents, talent] }));
+    }
+  };
+
+  const repositionInZone = (zone: TalentZone, talentId: number, row: number, col: number) => {
+    if (zone.type === 'class') {
+      setClassTree((tree) => ({
+        ...tree,
+        talents: tree.talents.map(t => t.id === talentId ? { ...t, row, col } : t),
+      }));
+    } else if (zone.type === 'spec') {
+      setSpec(activeSpecIdx, (spec) => ({
+        ...spec,
+        talents: spec.talents.map(t => t.id === talentId ? { ...t, row, col } : t),
+      }));
+    } else {
+      setHeroTree(activeSpecIdx, zone.heroIdx || 0, (tree) => ({
+        ...tree,
+        talents: tree.talents.map(t => t.id === talentId ? { ...t, row, col } : t),
+      }));
+    }
+  };
+
   const handleDrop = (row: number, col: number, target: TalentZone) => {
     if (dragTalentId === null || !dragSource) return;
-    if (dragSource.type !== target.type) return;
-    if (dragSource.type === 'hero' && dragSource.heroIdx !== target.heroIdx) return;
 
-    const getPool = (): TalentDef[] => {
-      if (target.type === 'class') return classTree.talents;
-      if (target.type === 'spec') return currentSpec?.talents || [];
-      return heroTrees[target.heroIdx || 0]?.talents || [];
-    };
+    const isSameZone = dragSource.type === target.type &&
+      (dragSource.type !== 'hero' || dragSource.heroIdx === target.heroIdx);
 
-    const pool = getPool();
-    const occupant = pool.find(t => t.row === row && t.col === col);
+    const occupant = getZonePool(target).find(t => t.row === row && t.col === col);
     if (occupant && occupant.id !== dragTalentId) {
       setStatus(`Cell (${row}, ${col}) occupied by #${occupant.id}`);
       setDragTalentId(null);
@@ -491,21 +530,30 @@ export default function TalentEditor(_props: TalentEditorProps) {
       return;
     }
 
-    if (target.type === 'class') {
-      setClassTree((tree) => ({
-        ...tree,
-        talents: tree.talents.map(t => t.id === dragTalentId ? { ...t, row, col } : t),
-      }));
-    } else if (target.type === 'spec') {
-      setSpec(activeSpecIdx, (spec) => ({
-        ...spec,
-        talents: spec.talents.map(t => t.id === dragTalentId ? { ...t, row, col } : t),
-      }));
+    if (isSameZone) {
+      repositionInZone(target, dragTalentId, row, col);
     } else {
-      setHeroTree(activeSpecIdx, target.heroIdx || 0, (tree) => ({
-        ...tree,
-        talents: tree.talents.map(t => t.id === dragTalentId ? { ...t, row, col } : t),
-      }));
+      // Cross-tree move (class <-> spec <-> hero, or hero 1 <-> hero 2): pull the
+      // talent out of its source tree's talent list and drop it into the target
+      // tree's list at the chosen cell.
+      const moving = getZonePool(dragSource).find(t => t.id === dragTalentId);
+      if (!moving) {
+        setDragTalentId(null);
+        setDragSource(null);
+        return;
+      }
+
+      // The "mastery" flag is only meaningful/editable on spec-tree talents -
+      // clear it if the talent is being moved out of the spec tree.
+      const movedTalent: TalentDef = {
+        ...moving,
+        row,
+        col,
+        mastery: target.type === 'spec' ? moving.mastery : false,
+      };
+
+      removeFromZone(dragSource, dragTalentId);
+      addToZone(target, movedTalent);
     }
 
     setDragTalentId(null);
@@ -951,9 +999,12 @@ export default function TalentEditor(_props: TalentEditorProps) {
                     const col1 = c + 1;
                     const centerCol = 2;
                     const isCorner = (row1 === 1 || row1 === SIDE_TREE_ROWS) && col1 !== centerCol;
-                    if (isCorner) return <div key={c} style={{ width: CELL_SIZE, height: CELL_SIZE }} />;
-
                     const talent = classZoneTalents.find(t => t.row === row1 && t.col === col1);
+                    // Corners are hidden decorative spacers ONLY when empty — a talent
+                    // that's already been placed there (e.g. via legacy data/migration)
+                    // must still render so it's visible/editable instead of silently
+                    // orphaned (this was hiding Corruption on Warlock's class tree).
+                    if (isCorner && !talent) return <div key={c} style={{ width: CELL_SIZE, height: CELL_SIZE }} />;
                     const isSelected = talent && selectedTalentId === talent.id;
                     if (talent) {
                       const iconUrl = getSpellIconUrl(talent.spells[0] || 0);
@@ -1227,9 +1278,9 @@ export default function TalentEditor(_props: TalentEditorProps) {
                     const col1 = c + 1;
                     const centerCol = 2;
                     const isCorner = (row1 === 1 || row1 === SIDE_TREE_ROWS) && col1 !== centerCol;
-                    if (isCorner) return <div key={c} style={{ width: CELL_SIZE, height: CELL_SIZE }} />;
-
                     const talent = heroZoneTalents.find(t => t.row === row1 && t.col === col1);
+                    // See Class Tree grid above — don't hide corners that already hold data.
+                    if (isCorner && !talent) return <div key={c} style={{ width: CELL_SIZE, height: CELL_SIZE }} />;
                     const isSelected = talent && selectedTalentId === talent.id;
                     if (talent) {
                       const iconUrl = getSpellIconUrl(talent.spells[0] || 0);
