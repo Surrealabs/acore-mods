@@ -1958,29 +1958,8 @@ export default function SpellEditor({ textColor, contentBoxColor }: Props) {
                   <div style={{ color: '#fca5a5' }}>{lookupError}</div>
                 ) : lookup ? (
                   <>
-                    <div><strong>Spell.dbc ID:</strong> {lookup.spellId}</div>
-                    <div><strong>SpellIconID:</strong> {lookup.spellIconId}</div>
-                    <div><strong>SQL table:</strong> {lookup.customSpell?.source || 'sdbeditor.spell'}</div>
-
-                    {activeTab !== 'base' ? (
-                      <>
-                        <div style={{ marginTop: 8 }}>
-                          <strong>Tooltip:</strong>
-                          <div style={{ color: '#cbd5e1', whiteSpace: 'pre-wrap', marginTop: 4 }}>
-                            {lookup.toolTip || 'No tooltip text present.'}
-                          </div>
-                        </div>
-                        <div style={{ marginTop: 8 }}>
-                          <strong>Description:</strong>
-                          <div style={{ color: '#cbd5e1', whiteSpace: 'pre-wrap', marginTop: 4 }}>
-                            {lookup.description || 'No description text present.'}
-                          </div>
-                        </div>
-                      </>
-                    ) : null}
-
                     {(activeTab === 'icon' || activeTab === 'visual') && lookup.referenceTables ? (
-                      <div style={{ marginTop: 8, borderTop: '1px solid #1f2937', paddingTop: 8 }}>
+                      <div style={{ borderTop: 'none', paddingTop: 0 }}>
                         <strong>Reference Tables (sdbeditor):</strong>
                         <div style={{ marginTop: 4, display: 'grid', gap: 4 }}>
                           {Object.entries(lookup.referenceTables)
