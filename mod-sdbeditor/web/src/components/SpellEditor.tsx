@@ -30,8 +30,6 @@ type SpellLookup = {
     visual?: Record<string, string | number | null>;
   };
   customSpell?: {
-    available?: boolean;
-    hasRecord?: boolean;
     source?: string;
   };
   referenceTables?: Record<string, {
@@ -84,7 +82,7 @@ type SpellEnumPayload = {
 };
 
 const TAB_FIELDS: Record<TabId, string[]> = {
-  base: ['Category', 'Dispel', 'Mechanic', 'CastingTimeIndex', 'DurationIndex', 'RangeIndex', 'MaximumLevel', 'BaseLevel', 'SpellLevel', 'RecoveryTime', 'CategoryRecoveryTime', 'StartRecoveryCategory', 'StartRecoveryTime', 'PowerType', 'ManaCost', 'ManaCostPerLevel', 'ManaPerSecond', 'ManaPerSecondPerLevel', 'ManaCostPercentage', 'Speed', 'StackAmount', 'ModalNextSpell', 'MaximumTargetLevel', 'MaximumAffectedTargets', 'RequiresSpellFocus', 'PreventionType', 'DamageClass', 'SpellFamilyName', 'SchoolMask', 'SpellMissileID', 'SpellVisual1', 'SpellVisual2', 'SpellPriority', 'RuneCostID', 'SpellDescriptionVariableID', 'SpellDifficultyID'],
+  base: ['SpellName', 'SpellRank', 'SpellDescription', 'SpellToolTip', 'Category', 'Dispel', 'Mechanic', 'CastingTimeIndex', 'DurationIndex', 'RangeIndex', 'MaximumLevel', 'BaseLevel', 'SpellLevel', 'RecoveryTime', 'CategoryRecoveryTime', 'StartRecoveryCategory', 'StartRecoveryTime', 'PowerType', 'ManaCost', 'ManaCostPerLevel', 'ManaPerSecond', 'ManaPerSecondPerLevel', 'ManaCostPercentage', 'Speed', 'StackAmount', 'ModalNextSpell', 'MaximumTargetLevel', 'MaximumAffectedTargets', 'RequiresSpellFocus', 'PreventionType', 'DamageClass', 'SpellFamilyName', 'SchoolMask', 'SpellMissileID', 'SpellVisual1', 'SpellVisual2', 'SpellPriority', 'RuneCostID', 'SpellDescriptionVariableID', 'SpellDifficultyID'],
   targetsProcs: ['Targets', 'TargetCreatureType', 'FacingCasterFlags', 'ProcFlags', 'ProcChance', 'ProcCharges', 'CasterAuraState', 'TargetAuraState', 'CasterAuraStateNot', 'TargetAuraStateNot', 'CasterAuraSpell', 'TargetAuraSpell', 'ExcludeCasterAuraSpell', 'ExcludeTargetAuraSpell'],
   effects: ['Effect1', 'Effect2', 'Effect3', 'EffectDieSides1', 'EffectDieSides2', 'EffectDieSides3', 'EffectRealPointsPerLevel1', 'EffectRealPointsPerLevel2', 'EffectRealPointsPerLevel3', 'EffectBasePoints1', 'EffectBasePoints2', 'EffectBasePoints3', 'EffectMechanic1', 'EffectMechanic2', 'EffectMechanic3', 'EffectImplicitTargetA1', 'EffectImplicitTargetA2', 'EffectImplicitTargetA3', 'EffectImplicitTargetB1', 'EffectImplicitTargetB2', 'EffectImplicitTargetB3', 'EffectRadiusIndex1', 'EffectRadiusIndex2', 'EffectRadiusIndex3', 'EffectApplyAuraName1', 'EffectApplyAuraName2', 'EffectApplyAuraName3', 'EffectAmplitude1', 'EffectAmplitude2', 'EffectAmplitude3', 'EffectMultipleValue1', 'EffectMultipleValue2', 'EffectMultipleValue3', 'EffectChainTarget1', 'EffectChainTarget2', 'EffectChainTarget3', 'EffectItemType1', 'EffectItemType2', 'EffectItemType3', 'EffectMiscValue1', 'EffectMiscValue2', 'EffectMiscValue3', 'EffectMiscValueB1', 'EffectMiscValueB2', 'EffectMiscValueB3', 'EffectTriggerSpell1', 'EffectTriggerSpell2', 'EffectTriggerSpell3'],
   items: ['Totem1', 'Totem2', 'Reagent1', 'Reagent2', 'Reagent3', 'Reagent4', 'Reagent5', 'Reagent6', 'Reagent7', 'Reagent8', 'ReagentCount1', 'ReagentCount2', 'ReagentCount3', 'ReagentCount4', 'ReagentCount5', 'ReagentCount6', 'ReagentCount7', 'ReagentCount8', 'EquippedItemClass', 'EquippedItemSubClassMask', 'EquippedItemInventoryTypeMask', 'TotemCategory1', 'TotemCategory2'],
@@ -1178,6 +1176,7 @@ export default function SpellEditor({ textColor, contentBoxColor }: Props) {
   const [newSpellId, setNewSpellId] = useState('');
   const [createLoading, setCreateLoading] = useState(false);
   const [suggestLoading, setSuggestLoading] = useState(false);
+  const [templatePanelCollapsed, setTemplatePanelCollapsed] = useState(false);
 
   const [manualSpellId, setManualSpellId] = useState('');
   const [batchIds, setBatchIds] = useState('');
@@ -1961,84 +1960,28 @@ export default function SpellEditor({ textColor, contentBoxColor }: Props) {
                   <>
                     <div><strong>Spell.dbc ID:</strong> {lookup.spellId}</div>
                     <div><strong>SpellIconID:</strong> {lookup.spellIconId}</div>
-                    <div><strong>Custom Spell DB:</strong> {lookup.customSpell?.available ? (lookup.customSpell?.hasRecord ? 'Record Exists' : 'No Row Yet') : 'Unavailable'}</div>
-                    {lookup.customSpell?.source ? <div><strong>Source:</strong> {lookup.customSpell.source}</div> : null}
+                    <div><strong>SQL table:</strong> {lookup.customSpell?.source || 'sdbeditor.spell'}</div>
 
-                    <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
-                      <label style={{ fontSize: 12 }}>
-                        <div style={{ marginBottom: 4 }}><strong>Template → New Spell ID</strong></div>
-                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                          <input
-                            type="number"
-                            value={newSpellId}
-                            onChange={(e) => setNewSpellId(e.target.value)}
-                            placeholder="New spell ID"
-                            style={{ width: 160, padding: 8, borderRadius: 6, border: '1px solid #374151', background: '#111827', color: '#e5e7eb' }}
-                          />
-                          <button
-                            onClick={suggestSpellId}
-                            disabled={suggestLoading}
-                            style={{
-                              padding: '8px 12px',
-                              borderRadius: 6,
-                              border: 'none',
-                              background: '#334155',
-                              color: '#fff',
-                              cursor: suggestLoading ? 'not-allowed' : 'pointer',
-                              fontWeight: 700,
-                            }}
-                          >
-                            {suggestLoading ? 'Suggesting...' : 'Suggest ID'}
-                          </button>
-                          <button
-                            onClick={createSpellFromTemplate}
-                            disabled={createLoading}
-                            style={{
-                              padding: '8px 12px',
-                              borderRadius: 6,
-                              border: 'none',
-                              background: '#7c3aed',
-                              color: '#fff',
-                              cursor: createLoading ? 'not-allowed' : 'pointer',
-                              fontWeight: 700,
-                            }}
-                          >
-                            {createLoading ? 'Creating...' : 'Create From Template'}
-                          </button>
-                          <button
-                            onClick={copySpell}
-                            style={{
-                              padding: '8px 12px',
-                              borderRadius: 6,
-                              border: 'none',
-                              background: '#1d4ed8',
-                              color: '#fff',
-                              cursor: 'pointer',
-                              fontWeight: 700,
-                            }}
-                          >
-                            Copy Spell
-                          </button>
+                    {activeTab !== 'base' ? (
+                      <>
+                        <div style={{ marginTop: 8 }}>
+                          <strong>Tooltip:</strong>
+                          <div style={{ color: '#cbd5e1', whiteSpace: 'pre-wrap', marginTop: 4 }}>
+                            {lookup.toolTip || 'No tooltip text present.'}
+                          </div>
                         </div>
-                      </label>
-                    </div>
-
-                    <div style={{ marginTop: 8 }}>
-                      <strong>Tooltip:</strong>
-                      <div style={{ color: '#cbd5e1', whiteSpace: 'pre-wrap', marginTop: 4 }}>
-                        {lookup.toolTip || 'No tooltip text present.'}
-                      </div>
-                    </div>
-                    <div style={{ marginTop: 8 }}>
-                      <strong>Description:</strong>
-                      <div style={{ color: '#cbd5e1', whiteSpace: 'pre-wrap', marginTop: 4 }}>
-                        {lookup.description || 'No description text present.'}
-                      </div>
-                    </div>
+                        <div style={{ marginTop: 8 }}>
+                          <strong>Description:</strong>
+                          <div style={{ color: '#cbd5e1', whiteSpace: 'pre-wrap', marginTop: 4 }}>
+                            {lookup.description || 'No description text present.'}
+                          </div>
+                        </div>
+                      </>
+                    ) : null}
 
                     {(activeTab === 'icon' || activeTab === 'visual') && lookup.referenceTables ? (
                       <div style={{ marginTop: 8, borderTop: '1px solid #1f2937', paddingTop: 8 }}>
-                        <strong>Reference Tables ({lookup.customSpell?.source === 'custom-override' ? 'sdbeditor' : 'dbc+sdbeditor'}):</strong>
+                        <strong>Reference Tables (sdbeditor):</strong>
                         <div style={{ marginTop: 4, display: 'grid', gap: 4 }}>
                           {Object.entries(lookup.referenceTables)
                             .filter(([fieldName]) => activeTab === 'icon' ? (fieldName === 'SpellIconID' || fieldName === 'ActiveIconID') : (fieldName === 'SpellVisual1' || fieldName === 'SpellVisual2' || fieldName === 'SpellMissileID'))
@@ -2069,13 +2012,13 @@ export default function SpellEditor({ textColor, contentBoxColor }: Props) {
                     <>
                     <div style={{ display: 'grid', gridTemplateColumns: activeTab === 'effects' ? '1fr 1fr 1fr' : '1fr 1fr', gap: 8, marginTop: 8, maxHeight: 380, overflowY: 'auto' }}>
                       {(TAB_FIELDS[activeTab] || []).map((field) => (
-                        <label key={field} style={{ fontSize: 12 }}>
+                        <label key={field} style={{ fontSize: 12, gridColumn: TEXT_FIELDS.has(field) ? '1 / -1' : undefined }}>
                           <div style={{ marginBottom: 4 }}>{field}</div>
                           {TEXT_FIELDS.has(field) ? (
                             <textarea
                               value={String(editFields[field] ?? '')}
                               onChange={(e) => setField(field, e.target.value)}
-                              rows={field === 'SpellToolTip' ? 4 : 3}
+                              rows={field === 'SpellToolTip' || field === 'SpellDescription' ? 4 : field === 'SpellName' ? 1 : 2}
                               style={{ width: '100%', padding: 8, borderRadius: 6, border: '1px solid #374151', background: '#111827', color: '#e5e7eb' }}
                             />
                           ) : BITMASK_FIELDS.has(field) ? (
@@ -2239,6 +2182,84 @@ export default function SpellEditor({ textColor, contentBoxColor }: Props) {
               })}
             </div>
           )}
+        </div>
+
+        <div style={{ padding: 16, background: contentBoxColor, borderRadius: 8 }}>
+          <div
+            onClick={() => setTemplatePanelCollapsed((v) => !v)}
+            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+          >
+            <h3 style={{ margin: 0 }}>Create From Template</h3>
+            <span style={{ fontSize: 12, color: '#94a3b8' }}>{templatePanelCollapsed ? '▸ Expand' : '▾ Collapse'}</span>
+          </div>
+          {!templatePanelCollapsed ? (
+            !selected || !lookup ? (
+              <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 8 }}>Select a spell first to clone/copy it.</div>
+            ) : (
+              <div style={{ marginTop: 10, display: 'grid', gap: 6 }}>
+                <div style={{ fontSize: 12, color: '#94a3b8' }}>Cloning: <strong style={{ color: textColor }}>{lookup.name || selected.name}</strong> (ID {selected.id})</div>
+                <label style={{ fontSize: 12 }}>
+                  <div style={{ marginBottom: 4 }}>New Spell ID</div>
+                  <input
+                    type="number"
+                    value={newSpellId}
+                    onChange={(e) => setNewSpellId(e.target.value)}
+                    placeholder="New spell ID"
+                    style={{ width: '100%', padding: 8, borderRadius: 6, border: '1px solid #374151', background: '#111827', color: '#e5e7eb', boxSizing: 'border-box' }}
+                  />
+                </label>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    onClick={suggestSpellId}
+                    disabled={suggestLoading}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: 6,
+                      border: 'none',
+                      background: '#334155',
+                      color: '#fff',
+                      cursor: suggestLoading ? 'not-allowed' : 'pointer',
+                      fontWeight: 700,
+                      fontSize: 12,
+                    }}
+                  >
+                    {suggestLoading ? 'Suggesting...' : 'Suggest ID'}
+                  </button>
+                  <button
+                    onClick={createSpellFromTemplate}
+                    disabled={createLoading}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: 6,
+                      border: 'none',
+                      background: '#7c3aed',
+                      color: '#fff',
+                      cursor: createLoading ? 'not-allowed' : 'pointer',
+                      fontWeight: 700,
+                      fontSize: 12,
+                    }}
+                  >
+                    {createLoading ? 'Creating...' : 'Create From Template'}
+                  </button>
+                  <button
+                    onClick={copySpell}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: 6,
+                      border: 'none',
+                      background: '#1d4ed8',
+                      color: '#fff',
+                      cursor: 'pointer',
+                      fontWeight: 700,
+                      fontSize: 12,
+                    }}
+                  >
+                    Copy Spell
+                  </button>
+                </div>
+              </div>
+            )
+          ) : null}
         </div>
       </div>
     </div>

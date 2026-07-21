@@ -897,10 +897,12 @@ async function buildSqlOnlySpellDetails(spellId) {
     description: String(overrides.Description || customRow.SpellDescription0 || ''),
     toolTip: String(overrides.ToolTip || customRow.SpellToolTip0 || ''),
     editable,
+    // This IS the one and only spell table other tools read/write too -
+    // `${CUSTOM_SPELL_DB}.spell` (default 'sdbeditor.spell'), a full mirror
+    // of every spell (vanilla + custom), not a separate/side database.
+    // "custom" here just means "SQL-backed", not "user-added-only".
     customSpell: {
-      available: true,
-      hasRecord: true,
-      source: 'custom-sql',
+      source: `${CUSTOM_SPELL_DB}.spell`,
     },
   };
 
