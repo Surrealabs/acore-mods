@@ -94,6 +94,100 @@ const TAB_FIELDS: Record<TabId, string[]> = {
 const TEXT_FIELDS = new Set(['SpellName', 'SpellRank', 'SpellToolTip', 'SpellDescription']);
 const REFERENCE_FIELDS = new Set(['SpellIconID', 'ActiveIconID', 'SpellVisual1', 'SpellVisual2', 'SpellMissileID']);
 
+// Effect-dependent Misc Value hints (like StoneHarry's Spell Editor) - keyed by
+// numeric SPELL_EFFECT_* id (see SharedDefines.h). Only covers effects whose
+// EffectMiscValue/EffectMiscValueB meaning is well established; unlisted
+// effects simply show no hint rather than guessing.
+const EFFECT_MISC_HINTS: Record<number, { a?: string; b?: string }> = {
+  8: { a: 'Power Type (0=Mana,1=Rage,2=Focus,3=Energy,6=RunicPower)' },       // POWER_DRAIN
+  16: { a: 'Quest ID' },                                                      // QUEST_COMPLETE
+  24: { a: 'Item ID (item_template entry)' },                                 // CREATE_ITEM
+  28: { a: 'Creature Entry (creature_template ID)', b: 'Summon Properties ID (SummonProperties.dbc)' }, // SUMMON
+  30: { a: 'Power Type (0=Mana,1=Rage,2=Focus,3=Energy,6=RunicPower)' },      // ENERGIZE
+  33: { a: 'Lock skill required (matches Lock.dbc requirement type)' },      // OPEN_LOCK
+  34: { a: 'Item ID (item_template entry)' },                                 // SUMMON_CHANGE_ITEM
+  36: { a: 'Spell ID to learn' },                                             // LEARN_SPELL
+  38: { a: 'Dispel Type mask' },                                              // DISPEL
+  39: { a: 'Language ID' },                                                  // LANGUAGE
+  53: { a: 'Item Enchantment ID (spell_item_enchantment)' },                 // ENCHANT_ITEM
+  54: { a: 'Item Enchantment ID (spell_item_enchantment)' },                 // ENCHANT_ITEM_TEMPORARY
+  56: { a: 'Creature Entry (pet creature_template ID)' },                    // SUMMON_PET
+  57: { a: 'Spell ID to learn' },                                            // LEARN_PET_SPELL
+  59: { a: 'Reference loot/item group (see spell_loot_template)' },          // CREATE_RANDOM_ITEM
+  61: { a: 'Event ID (used by scripts / EventAI)' },                         // SEND_EVENT
+  62: { a: 'Power Type (0=Mana,1=Rage,2=Focus,3=Energy,6=RunicPower)' },     // POWER_BURN
+  66: { a: 'Item ID (item_template entry)' },                                // CREATE_MANA_GEM
+  74: { a: 'Glyph Slot / GlyphProperties ID' },                              // APPLY_GLYPH
+  76: { a: 'GameObject Entry (gameobject_template ID)' },                    // SUMMON_OBJECT_WILD
+  90: { a: 'Creature Entry (kill credit target, 0 = self)' },                // KILL_CREDIT
+  92: { a: 'Item Enchantment ID (spell_item_enchantment)' },                 // ENCHANT_HELD_ITEM
+  101: { a: 'Item ID (food item, item_template entry)' },                    // FEED_PET
+  103: { a: 'Faction ID (Faction.dbc)' },                                   // REPUTATION
+  104: { a: 'GameObject Entry (gameobject_template ID)' },                   // SUMMON_OBJECT_SLOT1
+  105: { a: 'GameObject Entry (gameobject_template ID)' },                   // SUMMON_OBJECT_SLOT2
+  106: { a: 'GameObject Entry (gameobject_template ID)' },                   // SUMMON_OBJECT_SLOT3
+  107: { a: 'GameObject Entry (gameobject_template ID)' },                   // SUMMON_OBJECT_SLOT4
+  108: { a: 'Mechanic Type' },                                               // DISPEL_MECHANIC
+  118: { a: 'Skill Line ID (SkillLine.dbc)' },                               // SKILL
+  131: { a: 'Sound ID (SoundEntries.dbc)' },                                 // PLAY_SOUND
+  132: { a: 'Sound ID (SoundEntries.dbc, music track)' },                    // PLAY_MUSIC
+};
+
+// Effects whose EffectMiscValue meaning is actually governed by the aura type
+// (EffectApplyAuraNameN) rather than the effect itself.
+const AURA_EFFECT_IDS = new Set([6, 35, 65, 119, 128, 129, 143]);
+
+// Aura-dependent Misc Value hints - keyed by numeric SPELL_AURA_* id (see
+// SpellAuraDefines.h). Used when the effect is one of the "Apply (Area) Aura"
+// family above.
+const AURA_MISC_HINTS: Record<number, { a?: string; b?: string }> = {
+  4: { a: 'Script-defined (see spell_script)' },        // DUMMY
+  10: { a: 'School Mask (schools affected)' },           // MOD_THREAT
+  13: { a: 'School Mask (schools affected)' },           // MOD_DAMAGE_DONE
+  22: { a: 'School Mask (resistance school affected)' }, // MOD_RESISTANCE
+  24: { a: 'Power Type (0=Mana,1=Rage,2=Focus,3=Energy,6=RunicPower)' }, // PERIODIC_ENERGIZE
+  29: { a: 'Stat (-1=All, 0=Str,1=Agi,2=Stam,3=Int,4=Spirit)' }, // MOD_STAT
+  30: { a: 'Skill Line ID (SkillLine.dbc)' },            // MOD_SKILL
+  36: { a: 'Shapeshift Form ID' },                       // MOD_SHAPESHIFT
+  44: { a: 'Tracking Icon Index (hunter/rogue tracking UI slot)' }, // TRACK_CREATURES
+  45: { a: 'Tracking Icon Index (gathering skill UI slot)' },      // TRACK_RESOURCES
+  56: { a: 'Creature Entry (model sourced from creature_template)' }, // TRANSFORM
+  69: { a: 'School Mask (schools absorbed)' },           // SCHOOL_ABSORB
+  75: { a: 'Language ID' },                              // MOD_LANGUAGE
+  77: { a: 'Mechanic Type (immune to)' },                // MECHANIC_IMMUNITY
+  78: { a: 'Creature Display ID (mount model, CreatureDisplayInfo.dbc)' }, // MOUNTED
+  79: { a: 'School Mask (schools affected)' },           // MOD_DAMAGE_PERCENT_DONE
+  87: { a: 'School Mask (schools affected)' },           // MOD_DAMAGE_PERCENT_TAKEN
+  101: { a: 'School Mask (resistance school affected)' }, // MOD_RESISTANCE_PCT
+  107: { a: 'Spell Modifier Type (SpellModOp)' },        // ADD_FLAT_MODIFIER
+  108: { a: 'Spell Modifier Type (SpellModOp)' },        // ADD_PCT_MODIFIER
+  123: { a: 'School Mask (resistance school affected)' }, // MOD_TARGET_RESISTANCE
+  135: { a: 'School Mask (usually irrelevant for healing)' }, // MOD_HEALING_DONE
+  137: { a: 'Stat (-1=All, 0=Str,1=Agi,2=Stam,3=Int,4=Spirit)' }, // MOD_TOTAL_STAT_PERCENTAGE
+  189: { a: 'Combat Rating Mask (bitmask, see CombatRating enum)' }, // MOD_RATING
+  243: { a: 'Faction ID (Faction.dbc)' },                // MOD_FACTION
+};
+
+function getEffectMiscHint(field: string, editFields: Record<string, any>): string | null {
+  const match = /^EffectMiscValue(B?)([123])$/.exec(field);
+  if (!match) return null;
+  const isB = match[1] === 'B';
+  const slot = match[2];
+  const effectValue = Number(editFields[`Effect${slot}`] ?? 0);
+  if (!effectValue) return null;
+
+  if (AURA_EFFECT_IDS.has(effectValue)) {
+    const auraValue = Number(editFields[`EffectApplyAuraName${slot}`] ?? 0);
+    const auraHint = AURA_MISC_HINTS[auraValue];
+    if (auraHint) return (isB ? auraHint.b : auraHint.a) || null;
+    return isB ? null : `Depends on Aura Type (EffectApplyAuraName${slot})`;
+  }
+
+  const effectHint = EFFECT_MISC_HINTS[effectValue];
+  if (!effectHint) return null;
+  return (isB ? effectHint.b : effectHint.a) || null;
+}
+
 type ChainRowInfo = { id: number; row: Record<string, any>; sharedCount: number };
 type VisualChainBundle = {
   spellId: number;
@@ -1990,9 +2084,14 @@ export default function SpellEditor({ textColor, contentBoxColor }: Props) {
                     ) : (
                     <>
                     <div style={{ display: 'grid', gridTemplateColumns: activeTab === 'effects' ? '1fr 1fr 1fr' : '1fr 1fr', gap: 8, marginTop: 8, maxHeight: 380, overflowY: 'auto' }}>
-                      {(TAB_FIELDS[activeTab] || []).map((field) => (
+                      {(TAB_FIELDS[activeTab] || []).map((field) => {
+                        const miscHint = activeTab === 'effects' ? getEffectMiscHint(field, editFields) : null;
+                        return (
                         <label key={field} style={{ fontSize: 12, gridColumn: TEXT_FIELDS.has(field) ? '1 / -1' : undefined }}>
-                          <div style={{ marginBottom: 4 }}>{field}</div>
+                          <div style={{ marginBottom: 4 }}>
+                            {field}
+                            {miscHint ? <div style={{ color: '#facc15', fontWeight: 400, fontSize: 11, marginTop: 2 }}>{miscHint}</div> : null}
+                          </div>
                           {TEXT_FIELDS.has(field) ? (
                             <textarea
                               value={String(editFields[field] ?? '')}
@@ -2070,7 +2169,8 @@ export default function SpellEditor({ textColor, contentBoxColor }: Props) {
                             />
                           )}
                         </label>
-                      ))}
+                        );
+                      })}
                     </div>
 
                     <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
